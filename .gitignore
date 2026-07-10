@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+*.pid
+cloudflared*.log
+server*.log
+.tunnel/
+.tools/
+tools/*.exe
+data/*.log
+data/*.tmp
+data/*.txt
+data/store.json

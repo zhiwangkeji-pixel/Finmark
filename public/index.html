@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>估值手账</title>
+    <link rel="stylesheet" href="/styles.css?v=20260710-market-ui-1">
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="#/dashboard" aria-label="回到仪表盘">
+        <span class="brand-mark">Fin</span>
+        <span>
+          <strong data-i18n="appName">估值手账</strong>
+          <small data-i18n="appSubtitle">A 股股票池与估值纪律</small>
+        </span>
+      </a>
+      <nav class="nav" aria-label="主导航">
+        <a data-nav="dashboard" href="#/dashboard" data-i18n="navDashboard">仪表盘</a>
+        <section class="nav-section" data-nav-group="monitor">
+          <span data-i18n="navMonitor">我的监控</span>
+          <a data-nav="pool" href="#/pool" data-i18n="navPool">我的股票池</a>
+          <a data-nav="sector-pool" href="#/sector-pool" data-i18n="navSectorPool">我的板块池</a>
+          <a data-nav="valuations" href="#/valuations" data-i18n="navValuations">估值列表</a>
+        </section>
+        <section class="nav-section" data-nav-group="anomaly">
+          <span data-i18n="navAnomaly">异动监控</span>
+          <a data-nav="market" href="#/market" data-i18n="navMarket">市场观察</a>
+          <a data-nav="turnover" href="#/turnover" data-i18n="navTurnover">换手率异动</a>
+          <a data-nav="short-strategies" href="#/short-strategies" data-i18n="navShortStrategy">短线监控列表</a>
+          <a data-nav="decisions" href="#/decisions" data-i18n="navDecisions">决策复盘</a>
+        </section>
+        <section class="nav-section" data-nav-group="sector">
+          <span data-i18n="navSector">板块监控</span>
+          <a data-nav="sectors" href="#/sectors" data-i18n="navSectors">板块资金</a>
+          <a data-nav="strength" href="#/strength" data-i18n="navStrength">资金强弱矩阵</a>
+        </section>
+        <section class="nav-section admin-only" data-nav-group="system">
+          <span>系统管理</span>
+          <a data-nav="users" href="#/users">用户管理</a>
+        </section>
+      </nav>
+      <section class="sidebar-note">
+        <span data-i18n="localRunning">本地运行</span>
+        <p data-i18n="localRunningNote">TuShare token 只在服务端读取，前端不会暴露。</p>
+      </section>
+    </aside>
+
+    <section class="main-shell">
+      <header class="topbar">
+        <div class="topbar-search">
+          <span aria-hidden="true">⌕</span>
+          <input data-global-search data-i18n-placeholder="quickSearch" placeholder="搜索股票、板块或估值记录" aria-label="全局搜索">
+        </div>
+        <label class="language-switcher">
+          <span data-i18n="localeLabel">语言</span>
+          <select data-locale-select>
+            <option value="zh-CN">简体中文</option>
+            <option value="zh-TW">繁體中文</option>
+            <option value="en">English</option>
+            <option value="ja">日本語</option>
+          </select>
+        </label>
+        <div class="topbar-user" data-auth-user hidden></div>
+      </header>
+      <main id="app" class="app" aria-live="polite"></main>
+    </section>
+    <div id="modal-root"></div>
+
+    <script src="/app.js?v=20260710-decision-horizon-1" defer></script>
+  </body>
+</html>

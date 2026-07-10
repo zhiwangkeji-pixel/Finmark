@@ -1,0 +1,17 @@
+[Unit]
+Description=Valuation Diary Node Service
+After=network.target
+
+[Service]
+Type=simple
+User=valuation
+Group=valuation
+WorkingDirectory=/opt/valuation-diary
+EnvironmentFile=/etc/valuation-diary.env
+ExecStart=/usr/bin/node /opt/valuation-diary/server.js
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
