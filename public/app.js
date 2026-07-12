@@ -1,6 +1,7 @@
 const state = {
   route: parseRoute(),
   locale: initialLocale(),
+  sidebarExpanded: localStorage.getItem("finmark_sidebar_expanded") === "1",
   auth: {
     checked: false,
     authenticated: false,
@@ -14,6 +15,8 @@ const state = {
   selectedUserId: "",
   selectedUserLogins: null,
   selectedUserLoginsLoading: false,
+  selectedUserDevices: null,
+  selectedUserDevicesLoading: false,
   dashboard: null,
   groups: [],
   watchlist: [],
@@ -115,7 +118,14 @@ const state = {
   strengthView: "segment",
   strengthInfoTab: "score",
   strengthInfoOpen: false,
+  strengthExpandedSector: "",
   strengthPage: 1,
+  earningsForecast: null,
+  earningsForecastLoading: false,
+  earningsForecastError: "",
+  earningsForecastLevel: "L3",
+  earningsForecastDays: 30,
+  earningsForecastQuery: "",
   sectorFlow: null,
   sectorLoading: false,
   sectorError: "",
@@ -136,6 +146,7 @@ const state = {
   sectorPoolTrendError: "",
   sectorPoolTrendKey: "",
   sectorPoolVisibility: {},
+  sectorPoolExpandedSector: "",
   sectorPoolChartPoints: [],
   sectorChartPoints: [],
   sectorDetail: null,
@@ -156,6 +167,9 @@ const state = {
   },
   poolTab: "stocks",
   editing: null,
+  releaseNotice: null,
+  releaseNoticeLoading: false,
+  releaseNoticeError: "",
   toast: "",
   coreLoading: true,
   coreError: "",
@@ -164,6 +178,7 @@ const state = {
 const app = document.querySelector("#app");
 const modalRoot = document.querySelector("#modal-root");
 const DEFAULT_VALUATION_BAND_PCT = 20;
+const VALUATION_FEATURE_MESSAGE = "该功能开发中";
 const LOCALE_KEY = "valuation_diary_locale";
 const LOCALES = [
   { code: "zh-CN", label: "简体中文" },
@@ -174,13 +189,14 @@ const LOCALES = [
 let valuationStockSearchTimer = 0;
 let stockSuggestTimer = 0;
 let syncPollingTimer = 0;
+let listSearchRenderTimer = 0;
 
 const I18N = {
   "zh-CN": {
-    appName: "估值手账",
-    appSubtitle: "A 股股票池与估值纪律",
-    localRunning: "本地运行",
-    localRunningNote: "TuShare token 只在服务端读取，前端不会暴露。",
+    appName: "价投手账",
+    appSubtitle: "内部投研工具",
+    localRunning: "内部工具",
+    localRunningNote: "仅用于内部投研与数据跟踪，不作为对外商业版本。",
     quickSearch: "搜索股票、板块或估值记录",
     localeLabel: "语言",
     navDashboard: "仪表盘",
@@ -196,6 +212,10 @@ const I18N = {
     navSector: "板块监控",
     navSectors: "板块资金",
     navStrength: "资金强弱矩阵",
+    navSystem: "系统管理",
+    navAccount: "个人设置",
+    navAdmin: "管理员",
+    navUsers: "用户管理",
     dashboardEyebrow: "Value Investing Dashboard",
     dashboardTitle: "价值投资仪表盘",
     dashboardSubtitle: "围绕企业价值、价格偏离和长期跟踪，把你的股票池变成一套可复盘的投资纪律。",
@@ -239,10 +259,10 @@ const I18N = {
     search: "搜索",
   },
   "zh-TW": {
-    appName: "估值手帳",
-    appSubtitle: "A 股股票池與估值紀律",
-    localRunning: "本機執行",
-    localRunningNote: "TuShare token 只在服務端讀取，前端不會暴露。",
+    appName: "價投手帳",
+    appSubtitle: "內部投研工具",
+    localRunning: "內部工具",
+    localRunningNote: "僅用於內部投研與資料追蹤，不作為對外商業版本。",
     quickSearch: "搜尋股票、板塊或估值紀錄",
     localeLabel: "語言",
     navDashboard: "儀表板",
@@ -258,6 +278,10 @@ const I18N = {
     navSector: "板塊監控",
     navSectors: "板塊資金",
     navStrength: "資金強弱矩陣",
+    navSystem: "系統管理",
+    navAccount: "個人設定",
+    navAdmin: "管理員",
+    navUsers: "使用者管理",
     dashboardEyebrow: "Value Investing Dashboard",
     dashboardTitle: "價值投資儀表板",
     dashboardSubtitle: "圍繞企業價值、價格偏離和長期追蹤，把你的股票池變成一套可復盤的投資紀律。",
@@ -301,10 +325,10 @@ const I18N = {
     search: "搜尋",
   },
   en: {
-    appName: "Fin Diary",
-    appSubtitle: "A-share watchlist and valuation discipline",
-    localRunning: "Local",
-    localRunningNote: "TuShare token is read only by the server and is never exposed in the browser.",
+    appName: "Finmark",
+    appSubtitle: "Internal research workspace",
+    localRunning: "Internal tool",
+    localRunningNote: "For internal research and data tracking only. Not a public commercial edition.",
     quickSearch: "Search stocks, sectors, or valuations",
     localeLabel: "Language",
     navDashboard: "Dashboard",
@@ -320,6 +344,10 @@ const I18N = {
     navSector: "Sector Monitor",
     navSectors: "Sector Flows",
     navStrength: "Strength Matrix",
+    navSystem: "System",
+    navAccount: "Account",
+    navAdmin: "Admin",
+    navUsers: "Users",
     dashboardEyebrow: "Value Investing Dashboard",
     dashboardTitle: "Value Investing Dashboard",
     dashboardSubtitle: "Track intrinsic value, price deviation, and long-term discipline across your watchlist.",
@@ -363,10 +391,10 @@ const I18N = {
     search: "Search",
   },
   ja: {
-    appName: "Fin Diary",
-    appSubtitle: "A株ウォッチリストとバリュエーション規律",
-    localRunning: "ローカル実行",
-    localRunningNote: "TuShare token はサーバー側のみで読み取られ、ブラウザには表示されません。",
+    appName: "Finmark",
+    appSubtitle: "内部リサーチツール",
+    localRunning: "内部ツール",
+    localRunningNote: "内部リサーチとデータ追跡専用です。外部向け商用版ではありません。",
     quickSearch: "銘柄、セクター、評価記録を検索",
     localeLabel: "言語",
     navDashboard: "ダッシュボード",
@@ -382,6 +410,10 @@ const I18N = {
     navSector: "セクター監視",
     navSectors: "セクター資金",
     navStrength: "資金強弱マトリクス",
+    navSystem: "システム",
+    navAccount: "アカウント設定",
+    navAdmin: "管理者",
+    navUsers: "ユーザー管理",
     dashboardEyebrow: "Value Investing Dashboard",
     dashboardTitle: "バリュー投資ダッシュボード",
     dashboardSubtitle: "企業価値、価格乖離、長期追跡を軸に、ウォッチリストを再現可能な投資規律へ変えます。",
@@ -449,10 +481,11 @@ const DOM_TRANSLATIONS = {
 
 const UI_TRANSLATIONS = {
   ...DOM_TRANSLATIONS,
-  "估值手账": { "zh-TW": "估值手帳", en: "Fin Diary", ja: "Fin Diary" },
+  "估值手账": { "zh-CN": "价投手账", "zh-TW": "價投手帳", en: "Finmark", ja: "Finmark" },
+  "价投手账": { "zh-TW": "價投手帳", en: "Finmark", ja: "Finmark" },
   "A 股股票池与估值纪律": { "zh-TW": "A 股股票池與估值紀律", en: "A-share watchlist and valuation discipline", ja: "A株ウォッチリストと評価規律" },
-  "本地运行": { "zh-TW": "本機執行", en: "Local", ja: "ローカル実行" },
-  "TuShare token 只在服务端读取，前端不会暴露。": { "zh-TW": "TuShare token 只在服務端讀取，前端不會暴露。", en: "TuShare token is read only by the server and is never exposed in the browser.", ja: "TuShare token はサーバー側のみで読み取られ、ブラウザには表示されません。" },
+  "本地运行": { "zh-CN": "内部工具", "zh-TW": "內部工具", en: "Internal tool", ja: "内部ツール" },
+  "TuShare token 只在服务端读取，前端不会暴露。": { "zh-CN": "仅用于内部投研与数据跟踪，不作为对外商业版本。", "zh-TW": "僅用於內部投研與資料追蹤，不作為對外商業版本。", en: "For internal research and data tracking only. Not a public commercial edition.", ja: "内部リサーチとデータ追跡専用です。外部向け商用版ではありません。" },
   "语言": { "zh-TW": "語言", en: "Language", ja: "言語" },
   "仪表盘": { "zh-TW": "儀表板", en: "Dashboard", ja: "ダッシュボード" },
   "我的监控": { "zh-TW": "我的監控", en: "My Monitor", ja: "マイ監視" },
@@ -559,9 +592,9 @@ const UI_TRANSLATIONS = {
   "保存估值结果": { "zh-TW": "儲存估值結果", en: "Save Valuation", ja: "評価結果を保存" },
   "重新计算": { "zh-TW": "重新計算", en: "Recalculate", ja: "再計算" },
   "基础信息与数据回填": { "zh-TW": "基礎資訊與資料回填", en: "Basic Info and Data Fill", ja: "基本情報とデータ入力" },
-  "可手动填写，也可上传财报 PDF 让 Gemini 提取字段": { "zh-TW": "可手動填寫，也可上傳財報 PDF 讓 Gemini 提取欄位", en: "Fill manually or upload a PDF report for Gemini extraction", ja: "手入力またはPDF財報をアップロードして Gemini で抽出できます" },
+  "可手动填写，也可上传财报 PDF 让 AI 提取字段": { "zh-TW": "可手動填寫，也可上傳財報 PDF 讓 AI 提取欄位", en: "Fill manually or upload a PDF report for AI extraction", ja: "手入力またはPDF財報をアップロードして AI で抽出できます" },
   "上传财报 PDF": { "zh-TW": "上傳財報 PDF", en: "Upload Financial PDF", ja: "財報PDFをアップロード" },
-  "用 Gemini 回填财报字段": { "zh-TW": "用 Gemini 回填財報欄位", en: "Fill with Gemini", ja: "Geminiで入力" },
+  "用 AI 回填财报字段": { "zh-TW": "用 AI 回填財報欄位", en: "Fill with AI", ja: "AIで入力" },
   "提取中...": { "zh-TW": "提取中...", en: "Extracting...", ja: "抽出中..." },
   "选择估值方法": { "zh-TW": "選擇估值方法", en: "Choose Valuation Methods", ja: "評価方法を選択" },
   "财报原始字段": { "zh-TW": "財報原始欄位", en: "Raw Financial Fields", ja: "財務原始項目" },
@@ -726,7 +759,7 @@ const UI_TRANSLATIONS = {
   "成长调整市盈率": { "zh-TW": "成長調整本益比", en: "Growth-adjusted PE", ja: "成長調整PER" },
   "暂无备注": { "zh-TW": "暫無備註", en: "No note", ja: "メモなし" },
   "暂无估值依据": { "zh-TW": "暫無估值依據", en: "No valuation basis", ja: "評価根拠なし" },
-  "Gemini 公司信息分析": { "zh-TW": "Gemini 公司資訊分析", en: "Gemini Company Analysis", ja: "Gemini企業分析" },
+  "公司信息分析": { "zh-TW": "公司資訊分析", en: "Company Analysis", ja: "企業分析" },
   "最近更新": { "zh-TW": "最近更新", en: "Last updated", ja: "最終更新" },
   "输入板块名称、代码、状态或趋势": { "zh-TW": "輸入板塊名稱、代碼、狀態或趨勢", en: "Enter sector name, code, status, or trend", ja: "セクター名、コード、状態、トレンドを入力" },
   "当前视角": { "zh-TW": "當前視角", en: "Current View", ja: "現在の視点" },
@@ -977,6 +1010,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     await loadSession();
     if (state.auth.authenticated) {
       await loadCore();
+      await loadReleaseNotice();
     }
   } catch (error) {
     state.coreError = error.message;
@@ -992,6 +1026,8 @@ document.addEventListener("DOMContentLoaded", async () => {
 document.addEventListener("submit", handleSubmit);
 document.addEventListener("click", handleClick);
 document.addEventListener("change", handleChange);
+document.addEventListener("compositionstart", handleCompositionStart, true);
+document.addEventListener("compositionend", handleCompositionEnd, true);
 document.addEventListener("input", handleInput);
 document.addEventListener("toggle", handleToggle, true);
 window.addEventListener("error", (event) => {
@@ -1035,6 +1071,35 @@ async function loadCore() {
   state.strategyMonitors = strategyMonitors.items || [];
 }
 
+async function loadReleaseNotice() {
+  if (!state.auth.authenticated) {
+    state.releaseNotice = null;
+    return;
+  }
+  state.releaseNoticeLoading = true;
+  state.releaseNoticeError = "";
+  try {
+    const notice = await api("/api/release-notice");
+    state.releaseNotice = notice && notice.should_show ? notice : null;
+  } catch (error) {
+    state.releaseNoticeError = error.message || "更新公告读取失败";
+  } finally {
+    state.releaseNoticeLoading = false;
+  }
+}
+
+async function acknowledgeReleaseNotice() {
+  try {
+    await api("/api/release-notice/seen", { method: "POST" });
+    state.releaseNotice = null;
+    state.releaseNoticeError = "";
+    renderModal();
+  } catch (error) {
+    state.releaseNoticeError = error.message || "更新公告确认失败";
+    showToast(state.releaseNoticeError);
+  }
+}
+
 function render() {
   updateNav();
   updateShell();
@@ -1054,7 +1119,7 @@ function render() {
   if (!state.dashboard) {
     app.innerHTML = state.coreError
       ? renderBootError()
-      : `<section class="loading">${state.coreLoading ? "正在翻开估值手账..." : "正在等待初始化数据..."}</section>`;
+      : `<section class="loading">${state.coreLoading ? "正在打开价投手账..." : "正在等待初始化数据..."}</section>`;
     return;
   }
 
@@ -1069,12 +1134,12 @@ function render() {
   }
 
   if (state.route.page === "valuations") {
-    renderValuationList();
+    renderValuationFeaturePending();
     return;
   }
 
   if (state.route.page === "valuation") {
-    renderValuationWorkspace(state.route.id);
+    renderValuationFeaturePending();
     return;
   }
 
@@ -1108,6 +1173,11 @@ function render() {
     return;
   }
 
+  if (state.route.page === "earnings-forecast") {
+    renderEarningsForecast();
+    return;
+  }
+
   if (state.route.page === "sectors") {
     renderSectors();
     return;
@@ -1120,6 +1190,11 @@ function render() {
 
   if (state.route.page === "sector") {
     renderSectorDetail(state.route.id);
+    return;
+  }
+
+  if (state.route.page === "account") {
+    renderAccountSettings();
     return;
   }
 
@@ -1331,6 +1406,25 @@ function mergeValuationInputs(base, extra) {
   return output;
 }
 
+function renderValuationFeaturePending() {
+  app.innerHTML = `
+    ${renderToast()}
+    <section class="page-head">
+      <div>
+        <p class="eyebrow">Valuation Workbench</p>
+        <h1>估值功能</h1>
+        <p class="page-subtitle">${VALUATION_FEATURE_MESSAGE}</p>
+      </div>
+      <div class="head-actions">
+        <a class="button soft" href="#/dashboard">返回仪表盘</a>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="empty-inline">${VALUATION_FEATURE_MESSAGE}</div>
+    </section>
+  `;
+}
+
 function renderValuationList() {
   const rows = filterRowsByQuery(state.valuations || [], state.valuationQuery, ["name", "ts_code", "methods", "note"]);
   app.innerHTML = `
@@ -1438,7 +1532,7 @@ function renderValuationForm(draft) {
       <section class="panel valuation-input-panel">
         <div class="panel-head">
           <h2>基础信息与数据回填</h2>
-          <span>可手动填写，也可上传财报 PDF 让 Gemini 提取字段</span>
+          <span>可手动填写，也可上传财报 PDF 让 AI 提取字段</span>
         </div>
         <div class="valuation-basic-grid">
           <label><span>股票代码</span><input class="input" name="ts_code" value="${escapeAttr(draft.ts_code)}" placeholder="例如 300274.SZ" required></label>
@@ -1448,7 +1542,7 @@ function renderValuationForm(draft) {
         </div>
         <div class="valuation-pdf-row">
           <label><span>上传财报 PDF</span><input class="input" type="file" name="valuation_pdf" accept="application/pdf"></label>
-          <button class="button soft" type="button" data-action="extract-valuation-pdf" ${state.valuationPdfLoading ? "disabled" : ""}>${state.valuationPdfLoading ? "提取中..." : "用 Gemini 回填数据"}</button>
+          <button class="button soft" type="button" data-action="extract-valuation-pdf" ${state.valuationPdfLoading ? "disabled" : ""}>${state.valuationPdfLoading ? "提取中..." : "用 AI 回填数据"}</button>
           <small>${draft.pdf_file_name ? `已回填：${escapeHtml(draft.pdf_file_name)}` : "建议上传年报或半年报 PDF，回填后仍需人工复核。"}</small>
         </div>
       </section>
@@ -2047,7 +2141,7 @@ function renderValuationForm(draft) {
         </div>
         <div class="valuation-pdf-row">
           <label><span>上传财报 PDF</span><input class="input" type="file" name="valuation_pdf" accept="application/pdf"></label>
-          <button class="button soft" type="button" data-action="extract-valuation-pdf" ${state.valuationPdfLoading ? "disabled" : ""}>${state.valuationPdfLoading ? "提取中..." : "用 Gemini 回填财报字段"}</button>
+          <button class="button soft" type="button" data-action="extract-valuation-pdf" ${state.valuationPdfLoading ? "disabled" : ""}>${state.valuationPdfLoading ? "提取中..." : "用 AI 回填财报字段"}</button>
           <small>${draft.pdf_file_name ? `已回填：${escapeHtml(draft.pdf_file_name)}` : "上传年报或半年报 PDF，系统会尽量抽取最细财报字段，回填后仍建议人工复核。"}</small>
         </div>
       </section>
@@ -2854,7 +2948,7 @@ function renderValuationForm(draft) {
         </div>
         <div class="valuation-pdf-row">
           <label><span>上传财报 PDF</span><input class="input" type="file" name="valuation_pdf" accept="application/pdf"></label>
-          <button class="button soft" type="button" data-action="extract-valuation-pdf" ${state.valuationPdfLoading ? "disabled" : ""}>${state.valuationPdfLoading ? "提取中..." : "用 Gemini 回填财报字段"}</button>
+          <button class="button soft" type="button" data-action="extract-valuation-pdf" ${state.valuationPdfLoading ? "disabled" : ""}>${state.valuationPdfLoading ? "提取中..." : "用 AI 回填财报字段"}</button>
           <small>${draft.pdf_file_name ? `已回填：${escapeHtml(draft.pdf_file_name)}` : "上传年报、半年报或季报 PDF；系统会优先抽取多期财报列，回填后仍建议人工复核。"}</small>
         </div>
       </section>
@@ -3496,7 +3590,7 @@ function renderValuationDataFillPanel(draft) {
           <span>上传财报 PDF</span>
           <input class="input" type="file" name="valuation_pdf" accept="application/pdf">
         </label>
-        <button class="button soft" type="button" data-action="extract-valuation-pdf" ${state.valuationPdfLoading ? "disabled" : ""}>${state.valuationPdfLoading ? "提取中..." : "用 Gemini 回填"}</button>
+        <button class="button soft" type="button" data-action="extract-valuation-pdf" ${state.valuationPdfLoading ? "disabled" : ""}>${state.valuationPdfLoading ? "提取中..." : "用 AI 回填"}</button>
         <button class="button soft" type="button" data-action="fill-valuation-tushare" ${state.valuationTushareLoading || !hasStock ? "disabled" : ""}>${state.valuationTushareLoading ? "TuShare 回填中..." : "从 TuShare 带入"}</button>
       </div>
       <p class="valuation-source-hint">
@@ -3906,7 +4000,6 @@ function renderShortStrategyMonitorList() {
     "intraday.type",
     "intraday.strategy",
     "tplus1.strategy_text",
-    "grid.strategy_text",
   ]);
 
   app.innerHTML = `
@@ -3915,11 +4008,24 @@ function renderShortStrategyMonitorList() {
       <div>
         <p class="eyebrow">Short Strategy Watchlist</p>
         <h1 class="page-title">短线监控列表</h1>
-        <p class="page-subtitle">保存你关注股票的 T+1 日内做T 与 7-15 日网格策略快照，用列表快速复盘低吸区间、高抛区间、风险等级与策略提示。</p>
+        <p class="page-subtitle">保存你关注股票的 T+1 日内做T 策略快照，用列表快速复盘低吸区间、高抛区间、风险等级与策略提示。</p>
       </div>
       <div class="head-actions">
         <a class="button primary" href="#/short-strategy">新增策略参考</a>
       </div>
+    </section>
+
+    <section class="short-monitor-thesis">
+      <div>
+        <span>做T不是只看多</span>
+        <h2>A 股散户不能顺手做空，就把看空思维放进成本管理里。</h2>
+        <p>美股里可以用做空直接表达对价格回落的判断，但 A 股普通投资者更多时候只能持有、减仓或等待。做T的价值，就是把“价格可能回落”的判断转成先卖后买、回落再接、逐步降低持仓成本的纪律。仓位数量不一定变化，但成本线下降后，回撤压力、情绪波动和再次决策的难度都会下降。换句话说，降成本也是一种内部化的看空动作：不预测未来一定下跌，只是在波动发生时，把本来只能旁观的空头思维转成可复盘的成本管理。</p>
+      </div>
+      <ul>
+        <li><strong>看空不等于离场</strong><span>趋势不确定时，先降低成本，再观察是否买回。</span></li>
+        <li><strong>降成本也是收益</strong><span>同样的持仓数量，成本线越低，后续容错越高。</span></li>
+        <li><strong>用区间替代冲动</strong><span>低吸区、高抛区和风险等级，只作为复盘与触发条件参考。</span></li>
+      </ul>
     </section>
 
     <section class="panel">
@@ -3946,7 +4052,6 @@ function renderShortStrategyMonitorList() {
 
 function renderShortStrategyMonitorItem(item) {
   const tplus1 = item.tplus1 || {};
-  const grid = item.grid || {};
   const intraday = item.intraday || {};
   const intradayExtra = intraday.type
     ? `${intraday.type} / 回撤 ${formatRatioPct(intraday.avg_drawdown_amplitude)} / 反弹 ${formatRatioPct(intraday.avg_rebound_amplitude)}`
@@ -3974,16 +4079,6 @@ function renderShortStrategyMonitorItem(item) {
           note: tplus1.strategy_text,
           extra: intradayExtra,
         })}
-        ${renderShortStrategyMonitorLine({
-          title: "7-15 日网格策略",
-          rangeLabel: "网格下沿",
-          rangeValue: formatStrategyMonitorPrice(grid.grid_lower),
-          secondLabel: "网格上沿",
-          secondValue: formatStrategyMonitorPrice(grid.grid_upper),
-          risk: grid.risk_level,
-          note: grid.strategy_text,
-          extra: `${grid.horizon_days || "--"} 个交易日 / ${gridSuitabilityLabel(grid.suitability)}`,
-        })}
       </div>
     </article>
   `;
@@ -3996,7 +4091,7 @@ function renderShortStrategyMonitorLine({ title, rangeLabel, rangeValue, secondL
       <strong>${escapeHtml(title)}</strong>
       <span><em>${escapeHtml(rangeLabel)}</em>${escapeHtml(rangeValue)}</span>
       <span><em>${escapeHtml(secondLabel)}</em>${escapeHtml(secondValue)}</span>
-      <span class="strategy-monitor-risk ${escapeAttr(riskClass)}"><em>风险等级</em>${escapeHtml(riskLevelLabel(risk || "medium"))}</span>
+      <span class="strategy-monitor-risk ${escapeAttr(riskClass)}">${escapeHtml(riskLevelLabel(risk || "medium"))}</span>
       ${extra ? `<span><em>参数</em>${escapeHtml(extra)}</span>` : ""}
       <p>${escapeHtml(note || "--")}</p>
     </div>
@@ -4038,7 +4133,7 @@ function renderShortStrategyPage() {
     ${renderToast()}
     <section class="page-head">
       <div>
-        <p class="eyebrow">Grid Strategy</p>
+        <p class="eyebrow">T+1 Strategy</p>
         <h1 class="page-title">短线策略参考</h1>
         <p class="page-subtitle">基于历史振幅、均线、量能、ATR、支撑压力和涨跌停价格做区间测算，只提供可观察的参考条件，不做交易下单和确定性判断。</p>
       </div>
@@ -4061,7 +4156,7 @@ function renderShortStrategySearch() {
       <div class="panel-head">
         <div>
           <h2>选择股票</h2>
-          <span>输入股票名称或代码，从联想结果中选择后生成 T+1 和网格策略参考。</span>
+          <span>输入股票名称或代码，从联想结果中选择后生成 T+1 日内做T参考。</span>
         </div>
         <span class="muted">前端只请求本地后端接口，不展示 Tushare token</span>
       </div>
@@ -4105,11 +4200,7 @@ function renderShortStrategyState(status, model) {
     ${renderShortStrategyCharts(model)}
     ${renderShortStrategyCommon(model)}
     <section class="panel strategy-tabs-panel">
-      <div class="tabs" role="tablist">
-        <button class="${state.strategyTab === "tplus1" ? "active" : ""}" data-action="set-short-strategy-tab" data-tab="tplus1">T+1 日内做T</button>
-        <button class="${state.strategyTab === "grid" ? "active" : ""}" data-action="set-short-strategy-tab" data-tab="grid">7-15日网格策略</button>
-      </div>
-      ${state.strategyTab === "grid" ? renderGridStrategyTab(model) : renderTPlus1StrategyTab(model)}
+      ${renderTPlus1StrategyTab(model)}
     </section>
   `;
 }
@@ -4147,7 +4238,7 @@ function renderShortStrategyCommon(model) {
       <div class="panel-head">
         <div>
           <h2>通用分析结果</h2>
-          <span>两个策略共用同一组清洗后的历史行情、均线、量能和涨跌停状态。</span>
+          <span>T+1 日内做T参考使用清洗后的历史行情、均线、量能和涨跌停状态。</span>
         </div>
         <span>统计周期：近 ${analysis.sampleSize} 个有效交易日</span>
       </div>
@@ -4172,13 +4263,6 @@ function renderShortStrategyCharts(model) {
     <section class="strategy-chart-grid">
       <article class="panel">
         <div class="panel-head">
-          <h2>网格价格线</h2>
-          <span>展示网格上下沿和每一档网格线</span>
-        </div>
-        ${renderGridStrategySvg(model)}
-      </article>
-      <article class="panel">
-        <div class="panel-head">
           <h2>历史每日振幅</h2>
           <span>柱越高代表日内高低价区间越大</span>
         </div>
@@ -4200,7 +4284,7 @@ function renderTPlus1StrategyTab(model) {
   return `
     <div class="strategy-tab-body">
       ${renderTPlus1Controls()}
-      <section class="strategy-kpi-grid">
+      <section class="strategy-kpi-grid tplus-kpi-grid">
         ${renderStrategyInfo("下一交易日", formatDate(result.nextTradeDate), "")}
         ${renderStrategyInfo("基准价格", formatNumber(result.range.basePrice, 2), "元")}
         ${renderStrategyInfo("T+1低吸参考区", `${formatNumber(result.range.buyZoneLower, 2)} - ${formatNumber(result.range.buyZoneUpper, 2)}`, "元")}
@@ -4228,9 +4312,11 @@ function renderTPlus1Controls() {
       ${params.basePriceType === "holdingCost" ? renderStrategyNumber("持仓成本价", "t", "holdingCost", params.holdingCost, "元") : ""}
       ${params.basePriceType === "custom" ? renderStrategyNumber("自定义基准价", "t", "customBasePrice", params.customBasePrice, "元") : ""}
       ${renderStrategyNumber("安全边际", "t", "safetyMargin", params.safetyMargin, "小数，例如 0.003")}
-      ${renderStrategyCheckbox("趋势过滤", "t", "enableTrendFilter", params.enableTrendFilter)}
-      ${renderStrategyCheckbox("量能过滤", "t", "enableVolumeFilter", params.enableVolumeFilter)}
-      ${renderStrategyCheckbox("涨跌停过滤", "t", "enableLimitFilter", params.enableLimitFilter)}
+      ${renderStrategyFilterGroup([
+        ["趋势过滤", "t", "enableTrendFilter", params.enableTrendFilter],
+        ["量能过滤", "t", "enableVolumeFilter", params.enableVolumeFilter],
+        ["涨跌停过滤", "t", "enableLimitFilter", params.enableLimitFilter],
+      ])}
     </section>
   `;
 }
@@ -4574,10 +4660,14 @@ function renderStrategyCheckbox(label, group, name, checked) {
   `;
 }
 
+function renderStrategyFilterGroup(items) {
+  return `<div class="strategy-filter-group">${items.map(([label, group, name, checked]) => renderStrategyCheckbox(label, group, name, checked)).join("")}</div>`;
+}
+
 function renderShortStrategyDisclaimer() {
   return `
     <section class="strategy-disclaimer">
-      本工具仅根据历史价格波动、均线、成交量、ATR、支撑压力和涨跌停价格进行区间测算，不构成任何投资建议。T+1做T策略和7-15日网格策略均不代表未来价格一定会触达相关区间。历史波动不代表未来走势，极端行情、重大消息、涨跌停、停牌、流动性不足等情况下模型可能失效。用户应结合自身风险承受能力独立判断。
+      本工具仅根据历史价格波动、均线、成交量、支撑压力和涨跌停价格进行区间测算，不构成任何投资建议。T+1做T策略不代表未来价格一定会触达相关区间。历史波动不代表未来走势，极端行情、重大消息、涨跌停、停牌、流动性不足等情况下模型可能失效。用户应结合自身风险承受能力独立判断。
     </section>
   `;
 }
@@ -4801,7 +4891,7 @@ function buildTPlus1ProbabilityStats(rows, currentPrice, intradayProfiles = []) 
   const rebound2Probability = probabilityOf(profiles, (item) => item.reboundAmplitude >= 0.02);
   const drawdownDominanceProbability = probabilityOf(profiles, (item) => item.drawdownAmplitude >= item.reboundAmplitude * 1.2 && item.drawdownAmplitude >= 0.01);
   const reboundDominanceProbability = probabilityOf(profiles, (item) => item.reboundAmplitude >= item.drawdownAmplitude * 1.2 && item.reboundAmplitude >= 0.01);
-  const openingActionStats = [20, 10].map((days) => buildOpeningActionStats(profiles, days));
+  const openingActionStats = [20, 15, 10, 5].map((days) => buildOpeningActionStats(profiles, days));
   const shallowHighProbability = probabilityOf(profiles, (item) => item.highFromOpen <= 0.005);
   const weakCloseProbability = probabilityOf(profiles, (item) => item.closeFromOpen < 0);
   const gapDownRecoveryProbability = probabilityOf(profiles, (item) => item.gapFromPrev <= -0.01 && item.lowFromOpen <= -0.01 && item.closeFromOpen > 0);
@@ -4921,7 +5011,7 @@ function normalizeTPlus1IntradayProfiles(intradayProfiles, dailyByDate) {
 
 function buildOpeningActionStats(profiles, days) {
   const sample = profiles.slice(-days);
-  const minEdge = 0.005;
+  const minEdge = 0.01;
   const lowOpenThreshold = -0.003;
   const highOpenThreshold = 0.003;
   const lowOpenSample = sample.filter((item) => Number(item.gapFromPrev) <= lowOpenThreshold);
@@ -5656,6 +5746,7 @@ function renderStrengthMatrix() {
             ["today", "今日净流入"],
             ["net30", "30天净流入"],
             ["net90", "90天净流入"],
+            ["mainlineDuration", "主线持续"],
           ].map(([value, label]) => `<option value="${value}" ${state.strengthSort === value ? "selected" : ""}>${label}</option>`).join("")}
         </select>
       </label>
@@ -5682,14 +5773,180 @@ function renderStrengthOverview() {
     return "";
   }
   const summary = matrix.summary || {};
+  const longestMainline = (matrix.rows || [])
+    .filter((row) => Number(row.mainline_duration?.current_days || 0) > 0)
+    .sort((a, b) => Number(b.mainline_duration?.current_days || 0) - Number(a.mainline_duration?.current_days || 0))[0] || null;
   return `
     <section class="stat-grid strength-stats">
       ${renderStat("板块数量", summary.total ?? matrix.rows?.length ?? 0, "个", `${formatDate(matrix.start_date)} - ${formatDate(matrix.end_date)}`)}
       ${renderStat("主线增强", summary.mainline_count || 0, "个", "中短期资金共振流入")}
       ${renderStat("新启动", summary.new_start_count || 0, "个", "短周期明显转强")}
       ${renderStat("退潮预警", summary.warning_count || 0, "个", "中长期仍强但短期转弱")}
+      ${renderStat("最长主线", longestMainline ? sectorDisplayName(longestMainline) : "--", longestMainline ? `${formatNumber(longestMainline.mainline_duration.current_days, 0)}天` : "", longestMainline ? `自 ${formatDate(longestMainline.mainline_duration.current_start_date)}` : "暂无连续主线")}
     </section>
   `;
+}
+
+function renderEarningsForecast() {
+  ensureEarningsForecast();
+  app.innerHTML = `
+    ${renderToast()}
+    <section class="page-head">
+      <div>
+        <p class="eyebrow">Earnings Forecast</p>
+        <h1 class="page-title">财报预增</h1>
+        <p class="page-subtitle">按 TuShare 业绩预告接口聚合最近公告，把预增、略增、扭亏等正向业绩变化映射到申万板块，用来观察哪些方向正在出现基本面催化。</p>
+      </div>
+      <div class="head-actions">
+        <button class="button primary" data-action="refresh-earnings-forecast">刷新预增</button>
+      </div>
+    </section>
+
+    <section class="sector-controls earnings-forecast-controls">
+      <label>
+        <span>板块颗粒度</span>
+        <select class="select" data-earnings-forecast-control="level">
+          ${[
+            ["L1", "申万一级"],
+            ["L2", "申万二级"],
+            ["L3", "申万三级（最细）"],
+          ].map(([value, label]) => `<option value="${value}" ${state.earningsForecastLevel === value ? "selected" : ""}>${label}</option>`).join("")}
+        </select>
+      </label>
+      <label>
+        <span>公告范围</span>
+        <select class="select" data-earnings-forecast-control="days">
+          ${[7, 15, 30, 60, 90].map((days) => `<option value="${days}" ${state.earningsForecastDays === days ? "selected" : ""}>最近 ${days} 天</option>`).join("")}
+        </select>
+      </label>
+    </section>
+
+    ${state.earningsForecastLoading ? `<section class="loading">正在读取业绩预告公告，并聚合到板块维度...</section>` : renderEarningsForecastContent()}
+  `;
+}
+
+function renderEarningsForecastContent() {
+  if (state.earningsForecastError) {
+    return `<section class="notice warning">${escapeHtml(state.earningsForecastError)}</section>`;
+  }
+  if (!state.earningsForecast) {
+    return `<section class="empty-inline">点击刷新预增读取数据</section>`;
+  }
+
+  const data = state.earningsForecast;
+  const summary = data.summary || {};
+  const query = normalizeQuery(state.earningsForecastQuery);
+  const rows = (data.rows || []).filter((row) => {
+    if (!query) {
+      return true;
+    }
+    return normalizeQuery([
+      sectorSearchText(row),
+      row.representative_stocks?.map((stock) => `${stock.name} ${stock.ts_code} ${stock.type}`).join(" "),
+      row.stocks?.map((stock) => `${stock.name} ${stock.ts_code} ${stock.type}`).join(" "),
+    ].filter(Boolean).join(" ")).includes(query);
+  });
+
+  return `
+    <section class="stat-grid earnings-forecast-stats">
+      ${renderStat("公告股票", summary.forecast_count || 0, "只", `${formatDate(data.start_date)} - ${formatDate(data.end_date)}`)}
+      ${renderStat("正向预告", summary.positive_count || 0, "只", `占比 ${formatPlainPercent(summary.positive_ratio || 0)}`)}
+      ${renderStat("覆盖板块", summary.active_sector_count || 0, "个", `${sectorLevelLabel(data.level || state.earningsForecastLevel)} / 正向 ${summary.positive_sector_count || 0} 个`)}
+      ${renderStat("预增最集中", summary.top_sector ? sectorDisplayName(summary.top_sector) : "--", summary.top_sector ? `${summary.top_sector.positive_count || 0}只` : "", summary.top_sector ? `平均增幅 ${formatPercent(summary.top_sector.avg_change_mid_pct)}` : "暂无正向预告")}
+    </section>
+
+    <section class="panel table-panel earnings-forecast-panel">
+      <div class="panel-head">
+        <h2>${sectorLevelLabel(data.level || state.earningsForecastLevel)}财报预增热度</h2>
+        <span>${rows.length} / ${(data.rows || []).length} 个板块 · 公告日 ${formatDate(data.start_date)} - ${formatDate(data.end_date)}</span>
+      </div>
+      <div class="earnings-forecast-note">
+        <strong>口径说明</strong>
+        <span>正向预告包括预增、略增、扭亏、续盈、减亏；同一股票同一报告期保留最新公告。由于 TuShare forecast 接口按公告日查询，首次切换较长窗口会稍慢。</span>
+      </div>
+      ${renderListSearch("earningsForecast", state.earningsForecastQuery, "输入板块名称、代码或股票名称")}
+      ${renderEarningsForecastTable(rows)}
+      ${data.error_count ? `<div class="notice warning compact-note">有 ${formatNumber(data.error_count, 0)} 个公告日读取失败，页面已展示可用数据；稍后刷新可重试。</div>` : ""}
+    </section>
+  `;
+}
+
+function renderEarningsForecastTable(rows) {
+  if (!rows.length) {
+    return `<div class="empty-inline">没有匹配的财报预增数据</div>`;
+  }
+
+  return `
+    <div class="earnings-forecast-table">
+      <div class="earnings-forecast-head">
+        <span>板块</span>
+        <span>热度</span>
+        <span>正向预告</span>
+        <span>平均增幅</span>
+        <span>最大预增</span>
+        <span>代表股票</span>
+      </div>
+      ${rows.map((row) => renderEarningsForecastRow(row)).join("")}
+    </div>
+  `;
+}
+
+function renderEarningsForecastRow(row) {
+  const maxStock = row.max_change_stock;
+  const stockChips = (row.representative_stocks || []).slice(0, 8).map((stock) => `
+    <span class="forecast-stock-chip ${stock.positive ? "positive" : ""}" title="${escapeAttr([stock.summary, stock.change_reason].filter(Boolean).join(" / "))}">
+      <strong>${escapeHtml(stock.name || stock.ts_code)}</strong>
+      <small>${escapeHtml(stock.type || "--")} · ${formatForecastChangeRange(stock)}</small>
+    </span>
+  `).join("");
+  return `
+    <div class="earnings-forecast-row">
+      <div class="stock-cell">
+        <strong>${formatNumber(row.rank, 0)}. ${escapeHtml(sectorDisplayName(row))}</strong>
+        <span>${escapeHtml([row.code, sectorLevelLabel(row.level)].filter(Boolean).join(" / "))}</span>
+        <small>覆盖 ${formatNumber(row.forecast_count || 0, 0)} / ${formatNumber(row.member_count || 0, 0)} 只 · 最新 ${formatDate(row.latest_ann_date)}</small>
+      </div>
+      <div class="forecast-heat">
+        <strong>${formatScore(row.heat_score)}</strong>
+        <span>覆盖率 ${formatPlainPercent(row.coverage_ratio || 0)}</span>
+      </div>
+      <div>
+        <strong>${formatNumber(row.positive_count || 0, 0)} / ${formatNumber(row.forecast_count || 0, 0)} 只</strong>
+        <span>${formatPlainPercent(row.positive_ratio || 0)}</span>
+        <small>预增 ${formatNumber(row.preincrease_count || 0, 0)} · 扭亏 ${formatNumber(row.turnaround_count || 0, 0)}</small>
+      </div>
+      <div class="${toneClass(row.avg_change_mid_pct)}">
+        <strong>${formatPercent(row.avg_change_mid_pct)}</strong>
+        <span>正向样本均值</span>
+      </div>
+      <div class="forecast-max-stock">
+        ${maxStock ? `
+          <strong>${escapeHtml(maxStock.name || maxStock.ts_code)}</strong>
+          <span class="${toneClass(maxStock.change_mid_pct)}">${formatForecastChangeRange(maxStock)}</span>
+          <small>${escapeHtml(maxStock.type || "--")} · ${formatDate(maxStock.ann_date)}</small>
+        ` : "--"}
+      </div>
+      <div class="forecast-stock-list">${stockChips || "--"}</div>
+    </div>
+  `;
+}
+
+function formatForecastChangeRange(stock) {
+  const min = stock?.p_change_min === null || stock?.p_change_min === undefined ? NaN : Number(stock.p_change_min);
+  const max = stock?.p_change_max === null || stock?.p_change_max === undefined ? NaN : Number(stock.p_change_max);
+  if (Number.isFinite(min) && Number.isFinite(max) && min !== max) {
+    return `${formatPercent(min)} ~ ${formatPercent(max)}`;
+  }
+  if (Number.isFinite(min)) {
+    return formatPercent(min);
+  }
+  if (Number.isFinite(max)) {
+    return formatPercent(max);
+  }
+  if (Number.isFinite(Number(stock?.change_mid_pct))) {
+    return formatPercent(stock.change_mid_pct);
+  }
+  return "--";
 }
 
 function strengthStatusOptions() {
@@ -5740,14 +5997,16 @@ function renderStrengthContent() {
   const summary = matrix.summary || {};
   const columns = strengthColumns(matrix);
   const viewLabel = state.strengthView === "cumulative" ? "累计资金" : "分段趋势";
-  const searchedRows = filterRowsByQuery(matrix.rows || [], state.strengthQuery, [
-    "name",
-    "code",
-    "status",
-    "status_tags",
-    "trend_status",
-    "trend_tags",
-  ]);
+  const query = normalizeQuery(state.strengthQuery);
+  const searchedRows = query
+    ? (matrix.rows || []).filter((row) => normalizeQuery([
+      sectorSearchText(row),
+      row.status,
+      row.status_tags,
+      row.trend_status,
+      row.trend_tags,
+    ].flat().filter(Boolean).join(" ")).includes(query))
+    : (matrix.rows || []);
   const activeStatuses = selectedStrengthStatuses();
   const statusRows = activeStatuses.length === 0
     ? searchedRows
@@ -5762,7 +6021,7 @@ function renderStrengthContent() {
         <h2>${sectorLevelLabel(matrix.level || state.strengthLevel)}资金强弱</h2>
         <span>${viewLabel} · ${rows.length} / ${(matrix.rows || []).length} 个</span>
       </div>
-      ${renderListSearch("strength", state.strengthQuery, "输入板块名称、代码、状态或趋势")}
+      ${renderListSearch("strength", state.strengthQuery, "输入板块名称、代码、股票名、状态或趋势")}
       ${renderStrengthTable(rows, columns)}
     </section>
   `;
@@ -6009,6 +6268,34 @@ function renderStrengthTagLine(row) {
   `;
 }
 
+function renderMainlineDuration(row) {
+  const info = row.mainline_duration || {};
+  const currentDays = Number(info.current_days || 0);
+  const lastDays = Number(info.last_days || 0);
+  if (currentDays > 0) {
+    return `
+      <span class="mainline-duration-cell active" title="${escapeAttr(info.rule || "按多周期资金窗口判断")}">
+        <strong>${formatNumber(currentDays, 0)}天</strong>
+        <small>自 ${formatDate(info.current_start_date)}</small>
+      </span>
+    `;
+  }
+  if (lastDays > 0) {
+    return `
+      <span class="mainline-duration-cell faded" title="${escapeAttr(info.rule || "按多周期资金窗口判断")}">
+        <strong>--</strong>
+        <small>上次 ${formatNumber(lastDays, 0)}天 / 至 ${formatDate(info.last_end_date)}</small>
+      </span>
+    `;
+  }
+  return `
+    <span class="mainline-duration-cell empty" title="${escapeAttr(info.rule || "按多周期资金窗口判断")}">
+      <strong>未形成</strong>
+      <small>等待多周期共振</small>
+    </span>
+  `;
+}
+
 function renderStrengthTable(rows, columns) {
   const pageSize = 100;
   const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
@@ -6033,32 +6320,144 @@ function renderStrengthTable(rows, columns) {
         <span>综合</span>
         <span>单项评分</span>
         <span>板块池</span>
+        <span>主线持续</span>
         ${columns.map((column) => `<span>${escapeHtml(column.label)}</span>`).join("")}
       </div>
-      ${pageRows.map((row, index) => `
-        <article class="strength-row">
-          <button class="stock-cell" data-action="open-sector" data-code="${escapeAttr(row.code || "")}" data-level="${escapeAttr(row.level || state.strengthLevel)}">
-            <strong>${start + index + 1}. ${escapeHtml(row.name)}</strong>
-            <span>${escapeHtml(row.code || "")} / ${escapeHtml(row.status || "观察")}</span>
-            <small>趋势：${escapeHtml(row.trend_status || "观察")}</small>
-            ${renderStrengthTagLine(row)}
-          </button>
-          <span class="score-main ${scoreToneClass(row.overall_score)}">
-            <strong>${formatScore(row.overall_score)}</strong>
-            <small>价格 ${formatPercent(row.price_return_pct)}</small>
-          </span>
-          <span class="score-grid">
-            ${renderScoreBadge("资", row.fund_score)}
-            ${renderScoreBadge("续", row.persistence_score)}
-            ${renderScoreBadge("扩", row.diffusion_score)}
-            ${renderScoreBadge("价", row.price_score)}
-          </span>
-          <span>${renderSectorPoolButton(row)}</span>
-          ${columns.map((column) => renderStrengthCell(strengthCellForColumn(row, column), totalSectorCount)).join("")}
-        </article>
-      `).join("")}
+      ${pageRows.map((row, index) => {
+        const rowKey = strengthRowKey(row);
+        const expanded = state.strengthExpandedSector === rowKey;
+        return `
+          <article class="strength-row ${expanded ? "expanded" : ""}">
+            <span class="strength-sector-cell">
+              <button class="stock-cell" data-action="open-sector" data-code="${escapeAttr(row.code || "")}" data-level="${escapeAttr(row.level || state.strengthLevel)}">
+                <strong>${start + index + 1}. ${escapeHtml(sectorDisplayName(row))}</strong>
+                <span>${escapeHtml(row.code || "")} / ${escapeHtml(row.status || "观察")}</span>
+                <small>趋势：${escapeHtml(row.trend_status || "观察")}</small>
+                ${renderStrengthTagLine(row)}
+              </button>
+              <button
+                class="button tiny soft strength-expand-toggle"
+                type="button"
+                data-action="toggle-strength-daily"
+                data-key="${escapeAttr(rowKey)}"
+                aria-expanded="${expanded ? "true" : "false"}"
+              >${expanded ? "收起" : "展开"}</button>
+            </span>
+            <span class="score-main ${scoreToneClass(row.overall_score)}">
+              <strong>${formatScore(row.overall_score)}</strong>
+              <small>价格 ${formatPercent(row.price_return_pct)}</small>
+            </span>
+            <span class="score-grid">
+              ${renderScoreBadge("资", row.fund_score)}
+              ${renderScoreBadge("续", row.persistence_score)}
+              ${renderScoreBadge("扩", row.diffusion_score)}
+              ${renderScoreBadge("价", row.price_score)}
+            </span>
+            <span>${renderSectorPoolButton(row)}</span>
+            ${renderMainlineDuration(row)}
+            ${columns.map((column) => renderStrengthCell(strengthCellForColumn(row, column), totalSectorCount)).join("")}
+          </article>
+          ${expanded ? renderStrengthDailyFlow(row) : ""}
+        `;
+      }).join("")}
     </div>
     ${renderPagination("strength", state.strengthPage, totalPages, rows.length)}
+  `;
+}
+
+function strengthRowKey(row) {
+  return `${row.level || state.strengthLevel}:${row.code || row.name || ""}`;
+}
+
+function sectorPoolRowKey(item) {
+  return `${item.level || "L3"}:${item.code || item.id || item.name || ""}`;
+}
+
+function renderStrengthDailyFlow(row) {
+  const flows = Array.isArray(row.daily_flows) ? row.daily_flows.slice() : [];
+  const rows = flows
+    .filter((item) => item && item.trade_date)
+    .sort((a, b) => String(b.trade_date).localeCompare(String(a.trade_date)));
+
+  if (!rows.length) {
+    return `
+      <section class="strength-daily-flow">
+        <div class="empty-inline">暂无每日资金流明细，刷新矩阵后再试。</div>
+      </section>
+    `;
+  }
+
+  const totalNet = rows.reduce((sum, item) => sum + Number(item.net_amount || 0), 0);
+  const positiveDays = rows.filter((item) => Number(item.net_amount || 0) > 0).length;
+  const maxAbs = Math.max(1, ...rows.map((item) => Math.abs(Number(item.net_amount || 0))));
+  const avgNet = totalNet / rows.length;
+  const maxInflow = rows.reduce((best, item) => Number(item.net_amount || 0) > Number(best.net_amount || 0) ? item : best, rows[0]);
+  const maxOutflow = rows.reduce((best, item) => Number(item.net_amount || 0) < Number(best.net_amount || 0) ? item : best, rows[0]);
+  const latest = rows[0];
+  const earliest = rows.at(-1);
+
+  return `
+    <section class="strength-daily-flow">
+      <div class="strength-daily-summary">
+        <div>
+          <strong>${escapeHtml(sectorDisplayName(row))} 每日资金流</strong>
+          <span>${formatDate(earliest.trade_date)} - ${formatDate(latest.trade_date)} / ${rows.length} 个交易日</span>
+        </div>
+        <div>
+          <b class="${toneClass(totalNet)}">${formatWanAmount(totalNet)}</b>
+          <span>累计净流入 · 板块净流入天数 ${positiveDays}/${rows.length} 天</span>
+        </div>
+      </div>
+      <p class="strength-daily-explain">口径说明：矩阵格子里的“净流入天数”按板块每日净流入是否为正统计；下方卡片里的“成分股流入/流出”按当天板块内股票净流入、净流出的数量统计。</p>
+      <div class="strength-daily-metrics">
+        <span>
+          <small>累计净流入</small>
+          <b class="${toneClass(totalNet)}">${formatWanAmount(totalNet)}</b>
+        </span>
+        <span>
+          <small>板块净流入天数</small>
+          <b>${formatNumber(positiveDays, 0)} / ${formatNumber(rows.length, 0)}</b>
+        </span>
+        <span>
+          <small>日均净流入</small>
+          <b class="${toneClass(avgNet)}">${formatWanAmount(avgNet)}</b>
+        </span>
+        <span class="strength-peak-card peak-inflow">
+          <i>峰值</i>
+          <small>最大单日流入</small>
+          <b class="${toneClass(maxInflow.net_amount)}">${formatWanAmount(maxInflow.net_amount)}</b>
+          <em>${formatDate(maxInflow.trade_date)}</em>
+        </span>
+        <span class="strength-peak-card peak-outflow">
+          <i>风险</i>
+          <small>最大单日流出</small>
+          <b class="${toneClass(maxOutflow.net_amount)}">${formatWanAmount(maxOutflow.net_amount)}</b>
+          <em>${formatDate(maxOutflow.trade_date)}</em>
+        </span>
+      </div>
+      <div class="strength-daily-board" aria-label="每日资金流平铺明细">
+        ${rows.map((item) => {
+          const net = Number(item.net_amount || 0);
+          const width = Math.max(3, Math.min(50, Math.round((Math.abs(net) / maxAbs) * 50)));
+          const isMaxInflow = item.trade_date === maxInflow.trade_date && Number(item.net_amount || 0) === Number(maxInflow.net_amount || 0);
+          const isMaxOutflow = item.trade_date === maxOutflow.trade_date && Number(item.net_amount || 0) === Number(maxOutflow.net_amount || 0);
+          return `
+            <div class="strength-daily-tile ${net >= 0 ? "positive" : "negative"} ${isMaxInflow ? "peak-inflow" : ""} ${isMaxOutflow ? "peak-outflow" : ""}">
+              <span class="strength-daily-tile-top">
+                <b>${formatDateShort(item.trade_date)}</b>
+                <strong class="${toneClass(net)}">${formatCompactWanAmount(net)}</strong>
+              </span>
+              ${isMaxInflow ? `<em class="strength-daily-badge inflow">最大流入</em>` : ""}
+              ${isMaxOutflow ? `<em class="strength-daily-badge outflow">最大流出</em>` : ""}
+              <span class="strength-flow-track" title="${formatDate(item.trade_date)} 净流入 ${formatWanAmount(net)}" aria-hidden="true">
+                <i class="${net >= 0 ? "up" : "down"}" style="width:${width}%"></i>
+              </span>
+              <small>成分股流入 ${formatNumber(item.inflow_count, 0)} / 流出 ${formatNumber(item.outflow_count, 0)} · 覆盖 ${formatNumber(item.stock_count, 0)}</small>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    </section>
   `;
 }
 
@@ -6071,9 +6470,9 @@ function renderStrengthCell(cell, totalSectorCount) {
     return `<span class="matrix-cell empty">--</span>`;
   }
   return `
-    <span class="matrix-cell" style="${strengthCellStyle(cell)}" title="净流入 ${formatWanAmount(cell.net_amount)} / 正流入天数 ${formatNumber(cell.positive_days, 0)} / ${formatNumber(cell.days, 0)} / 资金排名 ${formatNumber(cell.net_rank, 0)} / ${formatNumber(totalSectorCount, 0)}">
+    <span class="matrix-cell" style="${strengthCellStyle(cell)}" title="净流入 ${formatWanAmount(cell.net_amount)} / 板块净流入天数 ${formatNumber(cell.positive_days, 0)} / ${formatNumber(cell.days, 0)} / 资金排名 ${formatNumber(cell.net_rank, 0)} / ${formatNumber(totalSectorCount, 0)}">
       <strong class="${toneClass(cell.net_amount)}">${formatWanAmount(cell.net_amount)}</strong>
-      <small>正流入${formatNumber(cell.positive_days, 0)}/${formatNumber(cell.days, 0)}天 · 排名${formatNumber(cell.net_rank, 0)}/${formatNumber(totalSectorCount, 0)}</small>
+      <small>净流入天数 ${formatNumber(cell.positive_days, 0)}/${formatNumber(cell.days, 0)} · 排名${formatNumber(cell.net_rank, 0)}/${formatNumber(totalSectorCount, 0)}</small>
     </span>
   `;
 }
@@ -6089,6 +6488,7 @@ function sortedStrengthRows(rows) {
     today: (row) => row.segments?.d1?.net_amount ?? row.windows?.[1]?.net_amount,
     net30: (row) => row.windows?.[30]?.net_amount,
     net90: (row) => row.windows?.[90]?.net_amount,
+    mainlineDuration: (row) => row.mainline_duration?.current_days || 0,
   };
   const accessor = sorters[state.strengthSort] || sorters.overall;
   return list.sort((a, b) => Number(accessor(b) || 0) - Number(accessor(a) || 0));
@@ -6165,14 +6565,19 @@ function renderSectorContent() {
   const sectors = state.sectorFlow.sectors || [];
   const visibleCount = sectors.filter((sector) => isSectorVisible(sector.name)).length;
   const surgeRows = buildSectorSurgeRows(state.sectorFlow);
-  const rankingRows = filterRowsByQuery(state.sectorFlow.ranking || [], state.sectorQuery, [
-    "name",
-    "code",
-    "top_inflow_stock.name",
-    "top_inflow_stock.ts_code",
-    "top_outflow_stock.name",
-    "top_outflow_stock.ts_code",
-  ]);
+  const sectorQuery = normalizeQuery(state.sectorQuery);
+  const rankingRows = (state.sectorFlow.ranking || []).filter((row) => {
+    if (!sectorQuery) {
+      return true;
+    }
+    return normalizeQuery([
+      sectorSearchText(row),
+      row.top_inflow_stock?.name,
+      row.top_inflow_stock?.ts_code,
+      row.top_outflow_stock?.name,
+      row.top_outflow_stock?.ts_code,
+    ].filter(Boolean).join(" ")).includes(sectorQuery);
+  });
 
   return `
     <section class="panel">
@@ -6393,8 +6798,10 @@ function renderSectorPoolTable(rows) {
       ${strengthRows.map((row, index) => {
         const item = row.item;
         const displayName = sectorPoolDisplayName(item);
+        const rowKey = sectorPoolRowKey(item);
+        const expanded = state.sectorPoolExpandedSector === rowKey;
         return `
-        <article class="strength-row sector-pool-strength-row" style="${gridStyle}">
+        <article class="strength-row sector-pool-strength-row ${expanded ? "expanded" : ""}" style="${gridStyle}">
           <button class="stock-cell" data-action="open-sector" data-code="${escapeAttr(item.code || "")}" data-level="${escapeAttr(item.level || "L3")}" ${item.code ? "" : "disabled"}>
             <strong>${index + 1}. ${escapeHtml(item.name)}</strong>
             <span>${escapeHtml(item.code || "")} / ${escapeHtml(row.status || "观察")}</span>
@@ -6417,10 +6824,17 @@ function renderSectorPoolTable(rows) {
           </span>
           ${columns.map((column) => renderStrengthCell(row.segments?.[column.key], totalSectorCount)).join("")}
           <span class="row-actions">
+            <button
+              class="button small soft strength-expand-toggle"
+              data-action="toggle-sector-pool-daily"
+              data-key="${escapeAttr(rowKey)}"
+              aria-expanded="${expanded ? "true" : "false"}"
+            >${expanded ? "收起" : "展开"}</button>
             <button class="button small" data-action="open-sector" data-code="${escapeAttr(item.code || "")}" data-level="${escapeAttr(item.level || "L3")}" ${item.code ? "" : "disabled"}>查看详情</button>
             <button class="button small danger" data-action="remove-sector-pool" data-sector-id="${escapeAttr(item.id)}">移出</button>
           </span>
         </article>
+        ${expanded ? renderStrengthDailyFlow(row) : ""}
       `; }).join("")}
     </div>
   `;
@@ -6493,7 +6907,9 @@ function buildSectorPoolStrengthRows(items, columns) {
       item,
       code: item.code,
       name: item.name,
+      display_name: sectorPoolDisplayName(item),
       level: item.level || "L3",
+      daily_flows: values,
       windows,
       segments,
       status_tags: [],
@@ -6536,6 +6952,9 @@ function sectorPoolDailyRows(item) {
       gross_amount: Number.isFinite(grossAmount) ? grossAmount : Math.abs(netAmount),
       stock_count: Number(source.stock_count || 0),
       inflow_count: Number(source.inflow_count || 0),
+      outflow_count: Number(source.outflow_count || 0),
+      diffusion_pct: Number.isFinite(Number(source.diffusion_pct)) ? Number(source.diffusion_pct) : null,
+      intensity_pct: Number.isFinite(Number(source.intensity_pct)) ? Number(source.intensity_pct) : null,
     };
   });
 }
@@ -6783,7 +7202,7 @@ function filterSectorPoolRows() {
   const query = normalizeQuery(state.sectorPoolQuery);
   return (state.sectorPool || [])
     .filter((item) => state.sectorPoolLevel === "all" || item.level === state.sectorPoolLevel)
-    .filter((item) => !query || normalizeQuery(`${item.name} ${item.code} ${sectorLevelLabel(item.level)}`).includes(query))
+    .filter((item) => !query || normalizeQuery(`${sectorSearchText(item)} ${sectorLevelLabel(item.level)}`).includes(query))
     .sort((a, b) => String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || "")));
 }
 
@@ -6803,7 +7222,46 @@ function makeSectorPoolKey(level, code, name) {
 
 function sectorPoolDisplayName(item) {
   const level = item.level || "L3";
-  return state.sectorPoolLevel === "all" ? `${item.name} (${level})` : item.name;
+  const name = sectorDisplayName(item);
+  return state.sectorPoolLevel === "all" ? `${name} (${level})` : name;
+}
+
+function sectorDisplayName(item) {
+  if (!item) {
+    return "";
+  }
+  const names = item.names || {};
+  const localeName = names[state.locale]
+    || (state.locale === "zh-CN" ? names["zh-CN"] : "")
+    || (state.locale === "zh-TW" ? names["zh-TW"] : "")
+    || names.en
+    || names.ja;
+  const baseName = localeName || item.display_name || item.name_zh_cn || item.name || item.source_name || item.code || "";
+  return state.locale === "zh-CN" ? baseName : (translateUiText(baseName) || baseName);
+}
+
+function sectorCanonicalName(item) {
+  return item?.name || item?.source_name || item?.name_zh_cn || item?.display_name || item?.code || "";
+}
+
+function sectorSearchText(item) {
+  const names = item?.names || {};
+  const memberText = Array.isArray(item?.member_search)
+    ? item.member_search.map((member) => [member.name, member.ts_code].filter(Boolean).join(" ")).join(" ")
+    : "";
+  return [
+    item?.name,
+    item?.display_name,
+    item?.source_name,
+    item?.code,
+    item?.level,
+    names["zh-CN"],
+    names["zh-TW"],
+    names.en,
+    names.ja,
+    sectorDisplayName(item),
+    memberText,
+  ].filter(Boolean).join(" ");
 }
 
 function isSectorPoolVisible(name) {
@@ -6815,7 +7273,7 @@ function filterSectorsByLegendQuery(sectors) {
   if (!query) {
     return sectors || [];
   }
-  return (sectors || []).filter((sector) => normalizeQuery(`${sector.name} ${sector.code}`).includes(query));
+  return (sectors || []).filter((sector) => normalizeQuery(sectorSearchText(sector)).includes(query));
 }
 
 function buildSectorSurgeRows(flow) {
@@ -7333,13 +7791,13 @@ function renderCompanyAnalysisTab() {
     : autoRunning
       ? "加入股票池后正在自动生成公司分析..."
       : latest
-        ? `最近更新 ${formatDateTime(latest.created_at)} / ${escapeHtml(latest.model || "Gemini")}`
+        ? `最近更新 ${formatDateTime(latest.created_at)} / 内容由 AI 生成，仅供参考`
         : "尚未生成分析";
   return `
     <div class="company-analysis">
       <div class="analysis-toolbar">
         <div>
-          <strong>Gemini 公司信息分析</strong>
+          <strong>公司信息分析</strong>
           <span>${statusText}</span>
         </div>
         <button class="button primary" data-action="refresh-company-analysis" data-code="${escapeAttr(item.ts_code || "")}" ${loading ? "disabled" : ""}>
@@ -7610,7 +8068,7 @@ function renderCompanyAnalysisHistory(history) {
       <summary>历史分析记录 ${history.length} 次</summary>
       <div>
         ${history.map((record, index) => `
-          <span>${index === 0 ? "当前" : `#${index + 1}`} · ${escapeHtml(record.input_company_name || record.stock_name || "")} · ${formatDateTime(record.created_at)} · ${escapeHtml(record.model || "Gemini")}</span>
+          <span>${index === 0 ? "当前" : `#${index + 1}`} · ${escapeHtml(record.input_company_name || record.stock_name || "")} · ${formatDateTime(record.created_at)} · 内容由 AI 生成，仅供参考</span>
         `).join("")}
       </div>
     </details>
@@ -8143,11 +8601,11 @@ function renderModal() {
           <div class="modal-head">
             <div>
               <h2 id="aiAssumptionErrorTitle">AI 预测失败</h2>
-              <p>Gemini 暂时没有返回可用的估值假设</p>
+              <p>AI 暂时没有返回可用的估值假设</p>
             </div>
             <button class="icon-button" data-action="close-ai-valuation-error" aria-label="关闭">×</button>
           </div>
-          <p class="valuation-ai-reason">${escapeHtml(state.valuationAiError.message || "请稍后重试，或检查 Gemini 网络与模型配置。")}</p>
+          <p class="valuation-ai-reason">${escapeHtml(state.valuationAiError.message || "请稍后重试，或检查 AI 网络与模型配置。")}</p>
           <div class="modal-actions">
             <button class="button primary" type="button" data-action="close-ai-valuation-error">知道了</button>
           </div>
@@ -8198,6 +8656,11 @@ function renderModal() {
         </section>
       </div>
     `;
+    return;
+  }
+
+  if (state.releaseNotice?.should_show) {
+    modalRoot.innerHTML = renderReleaseNoticeModal(state.releaseNotice);
     return;
   }
 
@@ -8252,6 +8715,38 @@ function renderModal() {
   `;
 }
 
+function renderReleaseNoticeModal(notice) {
+  const items = Array.isArray(notice.items) ? notice.items.filter(Boolean) : [];
+  return `
+    <div class="modal-backdrop release-notice-backdrop">
+      <section class="modal release-notice-modal" role="dialog" aria-modal="true" aria-labelledby="releaseNoticeTitle" data-modal>
+        <div class="modal-head">
+          <div>
+            <span class="eyebrow">Release Notes</span>
+            <h2 id="releaseNoticeTitle">${escapeHtml(notice.title || "更新公告")}</h2>
+            <p>${escapeHtml(notice.date || "")} · ${escapeHtml(notice.version || "")}</p>
+          </div>
+        </div>
+        <div class="release-notice-body">
+          <p class="release-notice-summary">${escapeHtml(notice.summary || "本次上线包含一些体验优化。")}</p>
+          <div class="release-notice-list">
+            ${items.map((item, index) => `
+              <article>
+                <span>${String(index + 1).padStart(2, "0")}</span>
+                <p>${escapeHtml(item)}</p>
+              </article>
+            `).join("")}
+          </div>
+          <p class="release-notice-tip">每次上线后，每个账号只会在首次登录时看到一次该公告。</p>
+        </div>
+        <div class="modal-actions release-notice-actions">
+          <button class="button primary" type="button" data-action="ack-release-notice">知道了，进入系统</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
 function renderToast() {
   if (!state.toast) {
     return "";
@@ -8262,7 +8757,7 @@ function renderToast() {
 function renderBootError() {
   return `
     <section class="boot-error">
-      <h1>估值手账没有打开成功</h1>
+      <h1>价投手账没有打开成功</h1>
       <p>${escapeHtml(state.coreError)}</p>
       <div class="head-actions">
         <button class="button primary" data-action="reload">重新加载</button>
@@ -8279,24 +8774,59 @@ function renderLoginPage() {
         <div class="auth-brand">
           <span class="brand-mark">Fin</span>
           <div>
-            <p class="eyebrow">BeeBee Finance</p>
-            <h1>登录估值手账</h1>
+            <p class="eyebrow">Finmark</p>
+            <h1>登录价投手账</h1>
           </div>
         </div>
-        <p class="auth-copy">登录后才能访问股票池、板块监控、估值模型和短线策略记录。默认管理员账号为 beebee。</p>
+        <p class="auth-copy">登录后才能访问你的股票池、板块监控、估值模型和短线策略记录。每个用户的数据独立保存，互不干扰。</p>
         ${state.loginError ? `<div class="form-error">${escapeHtml(state.loginError)}</div>` : ""}
         <form class="auth-form" data-form="login">
           <label>
             <span>用户名</span>
-            <input class="input" name="username" autocomplete="username" placeholder="beebee" required autofocus>
+            <input class="input" name="username" autocomplete="username" placeholder="请输入用户名" required autofocus>
           </label>
           <label>
             <span>密码</span>
-            <input class="input" name="password" type="password" autocomplete="current-password" placeholder="默认密码 qwer1234" required>
+            <input class="input" name="password" type="password" autocomplete="current-password" placeholder="请输入密码" required>
           </label>
           <button class="button primary" type="submit" ${state.loginLoading ? "disabled" : ""}>${state.loginLoading ? "登录中..." : "登录"}</button>
         </form>
       </div>
+    </section>
+  `;
+}
+
+function renderAccountSettings() {
+  app.innerHTML = `
+    ${renderToast()}
+    <section class="page-head">
+      <div>
+        <p class="eyebrow">Account Settings</p>
+        <h1 class="page-title">个人设置</h1>
+        <p class="page-subtitle">修改当前登录账号的密码。提交成功后会保留当前会话，其他旧会话会失效。</p>
+      </div>
+    </section>
+
+    <section class="account-settings-grid">
+      <article class="panel">
+        <header class="section-head">
+          <div>
+            <h2>修改我的密码</h2>
+            <p>需要输入旧密码，新密码至少 6 位。</p>
+          </div>
+        </header>
+        <form class="form-grid user-password-form" data-form="change-password">
+          <label>
+            <span>旧密码</span>
+            <input class="input" name="old_password" type="password" autocomplete="current-password" required>
+          </label>
+          <label>
+            <span>新密码</span>
+            <input class="input" name="new_password" type="password" autocomplete="new-password" required>
+          </label>
+          <button class="button primary" type="submit">修改密码</button>
+        </form>
+      </article>
     </section>
   `;
 }
@@ -8356,6 +8886,25 @@ function renderUserManagement() {
               <option value="admin">管理员</option>
             </select>
           </label>
+          <div class="user-validity-fields" data-user-validity-area>
+            <label>
+              <span>有效期</span>
+              <select class="input" name="validity_days" data-user-validity-select>
+                <option value="1">1 天</option>
+                <option value="3">3 天</option>
+                <option value="5">5 天</option>
+                <option value="7">7 天</option>
+                <option value="15">15 天</option>
+                <option value="30" selected>30 天</option>
+                <option value="custom">其他</option>
+              </select>
+            </label>
+            <label data-user-validity-custom hidden>
+              <span>自定义天数</span>
+              <input class="input" name="custom_validity_days" type="number" min="1" max="3650" placeholder="输入天数">
+            </label>
+          </div>
+          <p class="muted user-admin-validity-note" data-user-admin-validity-note hidden>管理员账号不限制有效期。</p>
           <button class="button primary" type="submit">添加用户</button>
         </form>
       </article>
@@ -8395,14 +8944,17 @@ function renderUserManagement() {
             <tr>
               <th>用户</th>
               <th>角色</th>
+              <th>账号状态</th>
+              <th>有效期至</th>
               <th>最后登录</th>
               <th>登录次数</th>
+              <th>登录设备</th>
               <th>创建时间</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody>
-            ${users.map((user) => renderUserRow(user)).join("") || `<tr><td colspan="6" class="muted">暂无用户</td></tr>`}
+            ${users.map((user) => renderUserRow(user)).join("") || `<tr><td colspan="9" class="muted">暂无用户</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -8417,11 +8969,37 @@ function renderUserManagement() {
       </header>
       ${renderSelectedUserLogins()}
     </section>
+
+    <section class="panel user-device-panel">
+      <header class="section-head">
+        <div>
+          <h2>登录设备</h2>
+          <p>${selectedUser ? `${escapeHtml(selectedUser.username)} 已记录的登录设备` : "点击用户列表中的“登录设备”查看"}</p>
+        </div>
+      </header>
+      ${renderSelectedUserDevices()}
+    </section>
   `;
+}
+
+function userStatusLabel(status) {
+  if (status === "locked") {
+    return "已锁定";
+  }
+  if (status === "expired") {
+    return "已过期";
+  }
+  return "正常";
 }
 
 function renderUserRow(user) {
   const isSelf = state.auth.user?.id === user.id;
+  const status = user.status || "active";
+  const isLocked = status === "locked";
+  const isExpired = status === "expired";
+  const statusClass = isLocked || isExpired ? "high" : "neutral";
+  const validityDays = Number(user.validity_days || 0);
+  const validityText = user.role === "admin" ? "管理员不限制" : (formatFullDateTime(user.expires_at) || "未设置");
   return `
     <tr>
       <td>
@@ -8429,18 +9007,43 @@ function renderUserRow(user) {
         ${isSelf ? `<small>当前登录</small>` : ""}
       </td>
       <td><span class="status-pill ${user.role === "admin" ? "high" : "neutral"}">${user.role === "admin" ? "管理员" : "普通用户"}</span></td>
+      <td>
+        <span class="status-pill ${statusClass}">${escapeHtml(userStatusLabel(status))}</span>
+        ${isLocked ? `<small>密码错误 ${Number(user.failed_login_count || 0)} 次</small>` : ""}
+      </td>
+      <td>
+        <strong>${escapeHtml(validityText)}</strong>
+        ${validityDays ? `<small>${validityDays} 天</small>` : ""}
+      </td>
       <td>${escapeHtml(formatDateTime(user.last_login_at))}</td>
       <td>${Number(user.login_count || 0)}</td>
+      <td>
+        <strong>${Number(user.device_count || 0)} 台</strong>
+        <button class="button compact" data-action="load-user-devices" data-id="${escapeAttr(user.id)}">登录设备</button>
+      </td>
       <td>${escapeHtml(formatDateTime(user.created_at))}</td>
       <td>
         <div class="table-actions">
           <button class="button compact" data-action="load-user-login-events" data-id="${escapeAttr(user.id)}">登录记录</button>
+          ${user.role === "admin" ? "" : `<button class="button compact" data-action="edit-user-validity" data-id="${escapeAttr(user.id)}">编辑有效期</button>`}
           ${isSelf ? "" : `<button class="button compact" data-action="reset-user-password" data-id="${escapeAttr(user.id)}">重置密码</button>`}
           ${isSelf ? "" : `<button class="button danger compact" data-action="delete-user" data-id="${escapeAttr(user.id)}">删除</button>`}
         </div>
       </td>
     </tr>
   `;
+}
+
+function formatFullDateTime(value) {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const pad = (number) => String(number).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 function renderSelectedUserLogins() {
@@ -8460,6 +9063,30 @@ function renderSelectedUserLogins() {
           <small>${escapeHtml(event.user_agent || "--")}</small>
         </div>
       `).join("") || `<p class="muted">暂无登录记录</p>`}
+    </div>
+  `;
+}
+
+function renderSelectedUserDevices() {
+  if (state.selectedUserDevicesLoading) {
+    return `<div class="loading compact">正在读取登录设备...</div>`;
+  }
+  if (!state.selectedUserDevices) {
+    return `<p class="muted">还没有选择用户。</p>`;
+  }
+  const devices = state.selectedUserDevices.devices || [];
+  return `
+    <div class="login-device-list">
+      ${devices.map((device) => `
+        <div class="login-device">
+          <div>
+            <strong>${escapeHtml(device.label || "未知设备")}</strong>
+            <span>${escapeHtml(device.ip || "--")} · ${escapeHtml(formatFullDateTime(device.last_seen_at) || "--")}</span>
+            <small>${escapeHtml(device.user_agent || "--")}</small>
+          </div>
+          <button class="button danger compact" data-action="delete-user-device" data-user-id="${escapeAttr(state.selectedUserDevices.user?.id || "")}" data-device-id="${escapeAttr(device.id)}">删除设备</button>
+        </div>
+      `).join("") || `<p class="muted">暂无登录设备</p>`}
     </div>
   `;
 }
@@ -8513,6 +9140,17 @@ async function handleSubmit(event) {
 }
 
 async function handleClick(event) {
+  const valuationAnchor = event.target.closest('a[href^="#/valuation"]');
+  if (valuationAnchor) {
+    event.preventDefault();
+    showToast(VALUATION_FEATURE_MESSAGE);
+    location.hash = "#/valuations";
+    if (state.route.page === "valuations" || state.route.page === "valuation") {
+      renderValuationFeaturePending();
+    }
+    return;
+  }
+
   const actionEl = event.target.closest("[data-action]");
   if (!actionEl) {
     return;
@@ -8521,6 +9159,14 @@ async function handleClick(event) {
   const action = actionEl.dataset.action;
   actionEl.blur?.();
 
+  if (action === "toggle-sidebar") {
+    event.preventDefault();
+    state.sidebarExpanded = !state.sidebarExpanded;
+    localStorage.setItem("finmark_sidebar_expanded", state.sidebarExpanded ? "1" : "0");
+    updateShell();
+    return;
+  }
+
   if (action === "logout") {
     await logout();
     return;
@@ -8528,6 +9174,21 @@ async function handleClick(event) {
 
   if (action === "load-user-login-events") {
     await loadUserLoginEvents(actionEl.dataset.id || "");
+    return;
+  }
+
+  if (action === "load-user-devices") {
+    await loadUserDevices(actionEl.dataset.id || "");
+    return;
+  }
+
+  if (action === "delete-user-device") {
+    await deleteUserDevice(actionEl.dataset.userId || "", actionEl.dataset.deviceId || "");
+    return;
+  }
+
+  if (action === "edit-user-validity") {
+    await editUserValidity(actionEl.dataset.id || "");
     return;
   }
 
@@ -8552,6 +9213,11 @@ async function handleClick(event) {
   if (action === "close-ai-valuation-error") {
     state.valuationAiError = null;
     renderModal();
+    return;
+  }
+
+  if (action === "ack-release-notice") {
+    await acknowledgeReleaseNotice();
     return;
   }
 
@@ -8756,6 +9422,12 @@ async function handleClick(event) {
     return;
   }
 
+  if (action === "refresh-earnings-forecast") {
+    await loadEarningsForecast(true);
+    render();
+    return;
+  }
+
   if (action === "set-strength-view") {
     state.strengthView = actionEl.dataset.view || "segment";
     state.strengthPage = 1;
@@ -8766,6 +9438,20 @@ async function handleClick(event) {
   if (action === "set-strength-info-tab") {
     state.strengthInfoTab = actionEl.dataset.tab === "labels" ? "labels" : "score";
     state.strengthInfoOpen = true;
+    render();
+    return;
+  }
+
+  if (action === "toggle-strength-daily") {
+    const key = actionEl.dataset.key || "";
+    state.strengthExpandedSector = state.strengthExpandedSector === key ? "" : key;
+    render();
+    return;
+  }
+
+  if (action === "toggle-sector-pool-daily") {
+    const key = actionEl.dataset.key || "";
+    state.sectorPoolExpandedSector = state.sectorPoolExpandedSector === key ? "" : key;
     render();
     return;
   }
@@ -8993,6 +9679,28 @@ function handleChange(event) {
     return;
   }
 
+  if (event.target.matches("[data-user-validity-select]")) {
+    const form = event.target.closest("form");
+    const customField = form?.querySelector("[data-user-validity-custom]");
+    const customInput = customField?.querySelector("input");
+    const isCustom = event.target.value === "custom";
+    if (customField) {
+      customField.hidden = !isCustom;
+    }
+    if (customInput) {
+      customInput.required = isCustom;
+      if (!isCustom) {
+        customInput.value = "";
+      }
+    }
+    return;
+  }
+
+  if (event.target.matches('[data-form="create-user"] [name="role"]')) {
+    syncUserValidityVisibility(event.target.closest("form"));
+    return;
+  }
+
   const editForm = event.target.closest('[data-form="edit-stock"]');
   if (editForm && state.editing && event.target.name) {
     state.editing[event.target.name] = event.target.value;
@@ -9078,6 +9786,20 @@ function handleChange(event) {
       return;
     }
 
+    const earningsForecastControl = event.target.dataset.earningsForecastControl;
+    if (earningsForecastControl === "level") {
+      state.earningsForecastLevel = event.target.value || "L3";
+      state.earningsForecast = null;
+      loadEarningsForecast(true).then(render);
+      return;
+    }
+    if (earningsForecastControl === "days") {
+      state.earningsForecastDays = Number(event.target.value) || 30;
+      state.earningsForecast = null;
+      loadEarningsForecast(true).then(render);
+      return;
+    }
+
     const sectorControl = event.target.dataset.sectorControl;
     if (sectorControl === "level") {
       state.sectorLevel = event.target.value || "L3";
@@ -9119,11 +9841,13 @@ function handleChange(event) {
       state.sectorPoolTrendFlow = null;
       state.sectorPoolTrendKey = "";
       state.sectorPoolVisibility = {};
+      state.sectorPoolExpandedSector = "";
       render();
       return;
     }
     if (sectorPoolControl === "trendDays") {
       state.sectorPoolTrendDays = Number(event.target.value) || 180;
+      state.sectorPoolExpandedSector = "";
       render();
       return;
     }
@@ -9168,7 +9892,43 @@ function handleToggle(event) {
   }
 }
 
+function handleCompositionStart(event) {
+  const target = event.target;
+  if (target?.matches?.("input, textarea")) {
+    target.dataset.imeComposing = "1";
+  }
+}
+
+function handleCompositionEnd(event) {
+  const target = event.target;
+  if (!target?.matches?.("input, textarea")) {
+    return;
+  }
+  target.dataset.imeComposing = "0";
+  requestAnimationFrame(() => {
+    if (target.isConnected) {
+      handleInput({ target, isComposing: false });
+    }
+  });
+}
+
+function isComposingInput(event) {
+  return Boolean(event?.isComposing || event?.target?.dataset?.imeComposing === "1");
+}
+
+function scheduleListSearchRender(kind, cursor) {
+  window.clearTimeout(listSearchRenderTimer);
+  listSearchRenderTimer = window.setTimeout(() => {
+    render();
+    restoreListSearchFocus(kind, cursor);
+  }, 120);
+}
+
 function handleInput(event) {
+  if (isComposingInput(event)) {
+    return;
+  }
+
   if (event.target.matches("[data-global-search]")) {
     applyGlobalSearch(event.target.value);
     return;
@@ -9251,6 +10011,9 @@ function handleInput(event) {
       state.strengthQuery = event.target.value;
       state.strengthPage = 1;
     }
+    if (listSearch === "earningsForecast") {
+      state.earningsForecastQuery = event.target.value;
+    }
     if (listSearch === "sector") {
       state.sectorQuery = event.target.value;
     }
@@ -9259,16 +10022,16 @@ function handleInput(event) {
     }
     if (listSearch === "sectorPool") {
       state.sectorPoolQuery = event.target.value;
+      state.sectorPoolExpandedSector = "";
     }
     if (listSearch === "sectorStock") {
       state.sectorStockQuery = event.target.value;
       state.sectorStockPage = 1;
     }
-    render();
     if (event.target.dataset.stockSuggestKind) {
       queueStockSuggest(listSearch, event.target.value, cursor);
     } else {
-      restoreListSearchFocus(listSearch, cursor);
+      scheduleListSearchRender(listSearch, cursor);
     }
     return;
   }
@@ -9276,6 +10039,27 @@ function handleInput(event) {
   const editForm = event.target.closest('[data-form="edit-stock"]');
   if (editForm && state.editing && event.target.name) {
     state.editing[event.target.name] = event.target.value;
+  }
+}
+
+function syncUserValidityVisibility(form) {
+  if (!form) {
+    return;
+  }
+  const role = form.elements.role?.value || "user";
+  const area = form.querySelector("[data-user-validity-area]");
+  const note = form.querySelector("[data-user-admin-validity-note]");
+  const customField = form.querySelector("[data-user-validity-custom]");
+  const customInput = customField?.querySelector("input");
+  if (area) {
+    area.hidden = role === "admin";
+  }
+  if (note) {
+    note.hidden = role !== "admin";
+  }
+  if (role === "admin" && customInput) {
+    customInput.required = false;
+    customInput.value = "";
   }
 }
 
@@ -9392,6 +10176,9 @@ function applyListSearchValue(kind, value) {
     state.strengthQuery = value;
     state.strengthPage = 1;
   }
+  if (kind === "earningsForecast") {
+    state.earningsForecastQuery = value;
+  }
 }
 
 function applyGlobalSearch(value) {
@@ -9405,6 +10192,7 @@ function applyGlobalSearch(value) {
     "short-strategies": "strategyMonitor",
     "short-strategy": "strategy",
     strength: "strength",
+    "earnings-forecast": "earningsForecast",
     sectors: "sector",
     "sector-pool": "sectorPool",
     sector: "sectorStock",
@@ -9594,6 +10382,7 @@ async function login(form) {
     state.dashboard = null;
     state.coreLoading = true;
     await loadCore();
+    await loadReleaseNotice();
     state.coreLoading = false;
     state.loginLoading = false;
     state.loginError = "";
@@ -9616,12 +10405,15 @@ async function logout() {
     // Logging out should still clear the local shell even if the session already expired.
   }
   state.auth = { checked: true, authenticated: false, user: null };
+  state.releaseNotice = null;
+  state.releaseNoticeError = "";
   state.dashboard = null;
   state.groups = [];
   state.watchlist = [];
   state.users = [];
   state.selectedUserId = "";
   state.selectedUserLogins = null;
+  state.selectedUserDevices = null;
   state.coreLoading = false;
   location.hash = "#/dashboard";
   render();
@@ -9667,6 +10459,7 @@ async function loadUsers(force = false) {
 
 async function createUser(form) {
   const data = Object.fromEntries(new FormData(form).entries());
+  const validityDays = data.validity_days === "custom" ? data.custom_validity_days : data.validity_days;
   try {
     await api("/api/users", {
       method: "POST",
@@ -9674,6 +10467,7 @@ async function createUser(form) {
         username: data.username,
         password: data.password,
         role: data.role,
+        validity_days: validityDays,
       }),
     });
     form.reset();
@@ -9690,7 +10484,11 @@ async function loadUserLoginEvents(id) {
   if (!id) {
     return;
   }
+  const changedUser = state.selectedUserId && state.selectedUserId !== id;
   state.selectedUserId = id;
+  if (changedUser) {
+    state.selectedUserDevices = null;
+  }
   state.selectedUserLogins = null;
   state.selectedUserLoginsLoading = true;
   render();
@@ -9700,6 +10498,86 @@ async function loadUserLoginEvents(id) {
     showToast(error.message || "登录记录读取失败");
   } finally {
     state.selectedUserLoginsLoading = false;
+    render();
+  }
+}
+
+async function loadUserDevices(id) {
+  if (!id) {
+    return;
+  }
+  const changedUser = state.selectedUserId && state.selectedUserId !== id;
+  state.selectedUserId = id;
+  if (changedUser) {
+    state.selectedUserLogins = null;
+  }
+  state.selectedUserDevices = null;
+  state.selectedUserDevicesLoading = true;
+  render();
+  try {
+    state.selectedUserDevices = await api(`/api/users/${encodeURIComponent(id)}/devices`);
+  } catch (error) {
+    showToast(error.message || "登录设备读取失败");
+  } finally {
+    state.selectedUserDevicesLoading = false;
+    render();
+  }
+}
+
+async function deleteUserDevice(userId, deviceId) {
+  if (!userId || !deviceId) {
+    return;
+  }
+  if (!window.confirm("确定删除这台已记录的登录设备吗？删除后该设备上的会话会失效。")) {
+    return;
+  }
+  try {
+    state.selectedUserDevices = await api(`/api/users/${encodeURIComponent(userId)}/devices/${encodeURIComponent(deviceId)}`, {
+      method: "DELETE",
+    });
+    await loadUsers(true);
+    showToast("登录设备已删除");
+    render();
+  } catch (error) {
+    showToast(error.message || "删除登录设备失败");
+    render();
+  }
+}
+
+async function editUserValidity(id) {
+  if (!id) {
+    return;
+  }
+  const user = state.users.find((item) => item.id === id);
+  if (!user) {
+    return;
+  }
+  if (user.role === "admin") {
+    showToast("管理员账号不限制有效期");
+    render();
+    return;
+  }
+  const currentDays = Number(user.validity_days || 30);
+  const input = window.prompt("请输入新的授权有效期天数，例如 1、3、5、7、15、30，或自定义整数。到期日按北京时间 23:59:59 失效。", String(currentDays || 30));
+  if (input === null) {
+    return;
+  }
+  const days = Number(String(input).trim());
+  if (!Number.isFinite(days) || days < 1 || days > 3650) {
+    showToast("有效期天数需要是 1 到 3650 之间的整数");
+    render();
+    return;
+  }
+  try {
+    await api(`/api/users/${encodeURIComponent(id)}/validity`, {
+      method: "PATCH",
+      body: JSON.stringify({ validity_days: Math.floor(days) }),
+    });
+    await loadUsers(true);
+    showToast("用户有效期已更新");
+    render();
+  } catch (error) {
+    showToast(error.message || "更新有效期失败");
     render();
   }
 }
@@ -9739,6 +10617,7 @@ async function deleteUser(id) {
     if (state.selectedUserId === id) {
       state.selectedUserId = "";
       state.selectedUserLogins = null;
+      state.selectedUserDevices = null;
     }
     await loadUsers(true);
     showToast("用户已删除");
@@ -10038,6 +10917,7 @@ async function addSectorPoolItem(item) {
     }
     state.sectorPoolTrendFlow = null;
     state.sectorPoolTrendKey = "";
+    state.sectorPoolExpandedSector = "";
     showToast(`${data.item.name} 已加入我的板块池`);
   } catch (error) {
     showToast(error.message);
@@ -10055,6 +10935,7 @@ async function removeSectorPoolItem(id) {
     state.sectorPool = (state.sectorPool || []).filter((entry) => entry.id !== id);
     state.sectorPoolTrendFlow = null;
     state.sectorPoolTrendKey = "";
+    state.sectorPoolExpandedSector = "";
     showToast(item ? `${item.name} 已移出我的板块池` : "已移出我的板块池");
   } catch (error) {
     showToast(error.message);
@@ -10585,6 +11466,43 @@ async function loadStrengthMatrix(force) {
     state.strengthError = error.message;
   } finally {
     state.strengthLoading = false;
+  }
+}
+
+function ensureEarningsForecast() {
+  if (!state.earningsForecast && !state.earningsForecastLoading && !state.earningsForecastError) {
+    loadEarningsForecast(false).then(render);
+  }
+}
+
+async function loadEarningsForecast(force) {
+  if (state.earningsForecastLoading) {
+    return;
+  }
+  if (state.earningsForecast && !force) {
+    return;
+  }
+
+  state.earningsForecastLoading = true;
+  state.earningsForecastError = "";
+  if (force) {
+    state.earningsForecast = null;
+    render();
+  }
+
+  try {
+    const params = new URLSearchParams({
+      level: state.earningsForecastLevel,
+      days: String(state.earningsForecastDays),
+    });
+    if (force) {
+      params.set("refresh", "1");
+    }
+    state.earningsForecast = await api(`/api/sectors/earnings-forecast?${params.toString()}`);
+  } catch (error) {
+    state.earningsForecastError = error.message;
+  } finally {
+    state.earningsForecastLoading = false;
   }
 }
 
@@ -11490,8 +12408,8 @@ function updateNav() {
 }
 
 function initialLocale() {
-  const stored = localStorage.getItem("valuation_diary_locale");
-  return ["zh-CN", "zh-TW", "en", "ja"].includes(stored) ? stored : "zh-CN";
+  localStorage.setItem("valuation_diary_locale", "zh-CN");
+  return "zh-CN";
 }
 
 function t(key) {
@@ -11499,6 +12417,15 @@ function t(key) {
 }
 
 Object.assign(UI_TRANSLATIONS, {
+  "做T不是只看多": { "zh-TW": "做T不是只看多", en: "T trading is not only bullish", ja: "T取引は強気だけではない" },
+  "A 股散户不能顺手做空，就把看空思维放进成本管理里。": { "zh-TW": "A 股散戶不能順手做空，就把看空思維放進成本管理裡。", en: "A-share retail investors cannot easily short, so bearish thinking should be folded into cost management.", ja: "A株の個人投資家は簡単に空売りできないため、弱気の発想をコスト管理に組み込みます。" },
+  "美股里可以用做空表达对价格回落的判断；A 股普通投资者更多时候只能持有、减仓或等待。做T的价值，就是把“价格可能回落”的判断转成先卖后买、降低持仓成本的纪律。成本降下来，本质上也是在用防守思维参与波动。": { "zh-TW": "美股裡可以用做空表達對價格回落的判斷；A 股普通投資者更多時候只能持有、減倉或等待。做T的價值，就是把「價格可能回落」的判斷轉成先賣後買、降低持倉成本的紀律。成本降下來，本質上也是在用防守思維參與波動。", en: "In US stocks, shorting can express a view that price may fall. In A-shares, most retail investors can only hold, trim, or wait. The value of T trading is to convert the view that price may pull back into the discipline of selling first, buying back later, and lowering cost basis. Reducing cost is another way to participate defensively in volatility.", ja: "米国株では空売りで価格下落の見方を表現できます。A株では多くの個人投資家は保有、減らす、待つしかありません。T取引の価値は、価格が下がるかもしれないという判断を、先に売って後で買い戻し、保有コストを下げる規律に変えることです。コストを下げることは、防御的に変動へ参加することでもあります。" },
+  "看空不等于离场": { "zh-TW": "看空不等於離場", en: "Bearish does not mean exiting", ja: "弱気は退場ではない" },
+  "趋势不确定时，先降低成本，再观察是否买回。": { "zh-TW": "趨勢不確定時，先降低成本，再觀察是否買回。", en: "When the trend is unclear, lower cost first, then observe whether to buy back.", ja: "トレンドが不明な時は、まずコストを下げ、買い戻すかを観察します。" },
+  "降成本也是收益": { "zh-TW": "降成本也是收益", en: "Lower cost is also return", ja: "コスト低下もリターン" },
+  "同样的持仓数量，成本线越低，后续容错越高。": { "zh-TW": "同樣的持倉數量，成本線越低，後續容錯越高。", en: "With the same position size, a lower cost basis gives more room for error.", ja: "同じ保有数量なら、コストラインが低いほど後の許容度が高くなります。" },
+  "用区间替代冲动": { "zh-TW": "用區間替代衝動", en: "Use ranges instead of impulse", ja: "衝動ではなくレンジで判断" },
+  "低吸区、高抛区和风险等级，只作为复盘与触发条件参考。": { "zh-TW": "低吸區、高拋區和風險等級，只作為復盤與觸發條件參考。", en: "Low zones, high zones, and risk levels are only references for review and trigger conditions.", ja: "低位ゾーン、高位ゾーン、リスクレベルは、振り返りとトリガー条件の参考にすぎません。" },
   "短线监控列表": { "zh-TW": "短線監控列表", en: "Short Watchlist", ja: "短期監視リスト" },
   "新增策略参考": { "zh-TW": "新增策略參考", en: "New Strategy Reference", ja: "戦略参考を追加" },
   "已保存策略": { "zh-TW": "已保存策略", en: "Saved Strategies", ja: "保存済み戦略" },
@@ -11707,8 +12634,23 @@ function translateElement(root) {
 function updateShell() {
   document.documentElement.lang = state.locale;
   document.title = t("appName");
+  document.body.dataset.page = state.route.page || "dashboard";
   document.body.classList.toggle("auth-mode", state.auth.checked && !state.auth.authenticated);
   document.body.classList.toggle("is-admin", isCurrentAdmin());
+  document.body.classList.toggle("sidebar-expanded", Boolean(state.sidebarExpanded));
+  const brandLink = document.querySelector(".brand");
+  if (brandLink) {
+    brandLink.dataset.action = "toggle-sidebar";
+    brandLink.setAttribute("aria-expanded", state.sidebarExpanded ? "true" : "false");
+    brandLink.setAttribute("title", state.sidebarExpanded ? "收起侧栏" : "展开侧栏");
+  }
+  const sidebarToggle = document.querySelector(".sidebar-toggle");
+  if (sidebarToggle) {
+    const label = state.sidebarExpanded ? "收起侧栏" : "展开侧栏";
+    sidebarToggle.setAttribute("aria-label", label);
+    sidebarToggle.setAttribute("title", label);
+    sidebarToggle.setAttribute("aria-expanded", state.sidebarExpanded ? "true" : "false");
+  }
   document.querySelectorAll("[data-i18n]").forEach((node) => {
     const key = node.dataset.i18n;
     if (key) node.textContent = t(key);
@@ -11981,6 +12923,9 @@ function parseRoute() {
   if (parts[0] === "strength") {
     return { page: "strength" };
   }
+  if (parts[0] === "earnings-forecast") {
+    return { page: "earnings-forecast" };
+  }
   if (parts[0] === "sectors") {
     return { page: "sectors" };
   }
@@ -12000,6 +12945,9 @@ function parseRoute() {
   }
   if (parts[0] === "groups") {
     return { page: "groups" };
+  }
+  if (parts[0] === "account") {
+    return { page: "account" };
   }
   if (parts[0] === "users") {
     return { page: "users" };

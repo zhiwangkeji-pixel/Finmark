@@ -28,12 +28,31 @@ const SHARE_COOKIE_MAX_AGE = 8 * 60 * 60;
 const SHARE_SESSION_TOKEN = SHARE_PASSWORD ? randomUUID() : "";
 const AUTH_COOKIE_NAME = "valuation_auth";
 const AUTH_COOKIE_MAX_AGE = 7 * 24 * 60 * 60;
+const LOGIN_MAX_FAILED_ATTEMPTS = 5;
+const LOGIN_FAILED_WINDOW_MS = 2 * 60 * 60 * 1000;
+const LOGIN_MAX_DEVICE_COUNT = 3;
+const DEVICE_COOKIE_NAME = "finmark_device_id";
+const DEVICE_COOKIE_MAX_AGE = 365 * 24 * 60 * 60;
+const CHINA_TIME_OFFSET_MS = 8 * 60 * 60 * 1000;
 const DEFAULT_ADMIN_USERNAME = process.env.DEFAULT_ADMIN_USERNAME || process.env.ADMIN_USERNAME || "beebee";
 const DEFAULT_ADMIN_PASSWORD =
   process.env.DEFAULT_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || (NODE_ENV === "production" ? "" : "qwer1234");
 const COOKIE_SECURE = parseBooleanEnv(process.env.COOKIE_SECURE, NODE_ENV === "production");
 const SYNC_RETRY_MS = Number(process.env.SYNC_RETRY_MS || 3 * 60 * 1000);
 const AUTO_SYNC_CHECK_MS = Number(process.env.AUTO_SYNC_CHECK_MS || 5 * 60 * 1000);
+const RELEASE_VERSION = process.env.RELEASE_VERSION || "20260712-release-notice-1";
+const RELEASE_NOTICE = {
+  version: RELEASE_VERSION,
+  title: "更新公告",
+  date: "2026-07-12",
+  summary: "本次更新主要优化了宽屏布局、侧栏交互、板块资金观察和估值页面体验。",
+  items: [
+    "估值页面的五种估值方法已在桌面端一行展示，选择和对比更直观。",
+    "侧栏恢复为点击左上角 Fin/价投手账区域展开或收起，减少额外按钮干扰。",
+    "我的板块池、板块资金等页面统一为更宽的布局，便于展示更多数据。",
+    "资金强弱矩阵和我的板块池支持展开查看每日资金流，并突出最大单日流入与流出。",
+  ],
+};
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -82,6 +101,7 @@ const dailyBasicByDateCache = new Map();
 const dailySeriesCache = new Map();
 const strategyIntradayProfileCache = new Map();
 const sectorStrengthCache = new Map();
+const earningsForecastCache = new Map();
 const companyAnalysisJobs = new Map();
 const targetTradeDateCache = {
   expiresAt: 0,
@@ -194,6 +214,7 @@ function ensureDefaultAdminUser() {
   db.users = Array.isArray(db.users) ? db.users : [];
   db.login_events = Array.isArray(db.login_events) ? db.login_events : [];
   db.sessions = Array.isArray(db.sessions) ? db.sessions : [];
+  db.login_devices = Array.isArray(db.login_devices) ? db.login_devices : [];
 
   const normalizedAdminName = normalizeUsername(DEFAULT_ADMIN_USERNAME);
   let admin = db.users.find((user) => normalizeUsername(user.username) === normalizedAdminName);
@@ -226,7 +247,36 @@ function ensureDefaultAdminUser() {
     changed = true;
   }
 
+  if (Number(db.auth_policy_version || 0) < 2) {
+    const migrationBaseTime = Date.now();
+    for (const user of db.users) {
+      if (isAdminUser(user)) {
+        user.validity_days = null;
+        user.expires_at = "";
+      } else {
+        user.validity_days = 30;
+        user.expires_at = expiryFromValidityDays(30, migrationBaseTime);
+      }
+      user.failed_login_attempts = Array.isArray(user.failed_login_attempts) ? user.failed_login_attempts : [];
+      user.failed_login_count = Number(user.failed_login_count || 0);
+      user.login_locked_at = user.login_locked_at || "";
+      user.updated_at = user.updated_at || nowIso();
+    }
+    db.auth_policy_version = 2;
+    changed = true;
+  }
+
   db.sessions = db.sessions.filter((session) => new Date(session.expires_at).getTime() > Date.now());
+  const userIds = new Set((db.users || []).map((user) => user.id));
+  const activeDevices = db.login_devices.filter((device) => userIds.has(device.user_id));
+  if (activeDevices.length !== db.login_devices.length) {
+    db.login_devices = activeDevices;
+    changed = true;
+  }
+
+  if (ensureLegacyOwnerData(admin.id)) {
+    changed = true;
+  }
 
   if (changed) {
     fs.mkdirSync(dataDir, { recursive: true });
@@ -274,6 +324,7 @@ function publicUser(user) {
   if (!user) {
     return null;
   }
+  const admin = isAdminUser(user);
   return {
     id: user.id,
     username: user.username,
@@ -281,7 +332,198 @@ function publicUser(user) {
     created_at: user.created_at || "",
     updated_at: user.updated_at || "",
     last_login_at: user.last_login_at || "",
+    expires_at: admin ? "" : user.expires_at || "",
+    validity_days: admin ? null : user.validity_days || null,
+    failed_login_count: recentFailedAttempts(user).length,
+    login_locked_at: user.login_locked_at || "",
+    device_count: activeLoginDevices(user.id).length,
+    status: userStatus(user),
   };
+}
+
+function userStatus(user) {
+  if (isUserExpired(user)) {
+    return "expired";
+  }
+  if (isUserLocked(user)) {
+    return "locked";
+  }
+  return "active";
+}
+
+function isUserExpired(user) {
+  if (isAdminUser(user)) {
+    return false;
+  }
+  if (!user?.expires_at) {
+    return false;
+  }
+  const time = new Date(user.expires_at).getTime();
+  return Number.isFinite(time) && time <= Date.now();
+}
+
+function isUserLocked(user) {
+  return recentFailedAttempts(user).length >= LOGIN_MAX_FAILED_ATTEMPTS || Boolean(user?.login_locked_at);
+}
+
+function recentFailedAttempts(user, now = Date.now()) {
+  const attempts = Array.isArray(user?.failed_login_attempts) ? user.failed_login_attempts : [];
+  return attempts.filter((attempt) => {
+    const time = new Date(attempt?.at || attempt).getTime();
+    return Number.isFinite(time) && now - time <= LOGIN_FAILED_WINDOW_MS;
+  });
+}
+
+function registerFailedLogin(user, req) {
+  const now = Date.now();
+  const attempts = [
+    ...recentFailedAttempts(user, now),
+    {
+      at: nowIso(),
+      ip: clientIp(req),
+      user_agent: String(req?.headers?.["user-agent"] || "").slice(0, 300),
+    },
+  ].slice(-LOGIN_MAX_FAILED_ATTEMPTS);
+  user.failed_login_attempts = attempts;
+  const count = attempts.length;
+  user.failed_login_count = count;
+  user.last_failed_login_at = nowIso();
+  user.updated_at = nowIso();
+  if (count >= LOGIN_MAX_FAILED_ATTEMPTS) {
+    user.login_locked_at = user.login_locked_at || nowIso();
+  }
+  return count;
+}
+
+function clearFailedLogin(user) {
+  user.failed_login_count = 0;
+  user.failed_login_attempts = [];
+  user.login_locked_at = "";
+  user.last_failed_login_at = "";
+}
+
+function normalizeValidityDays(value, fallback = 30) {
+  const days = Number(value);
+  if (!Number.isFinite(days) || days <= 0) {
+    return fallback;
+  }
+  return Math.max(1, Math.min(3650, Math.floor(days)));
+}
+
+function expiryFromValidityDays(days, baseTime = Date.now()) {
+  const normalizedDays = normalizeValidityDays(days);
+  const baseMs = baseTime instanceof Date ? baseTime.getTime() : new Date(baseTime || Date.now()).getTime();
+  const safeBase = Number.isFinite(baseMs) ? baseMs : Date.now();
+  const china = new Date(safeBase + CHINA_TIME_OFFSET_MS);
+  const expiryUtcMs =
+    Date.UTC(
+      china.getUTCFullYear(),
+      china.getUTCMonth(),
+      china.getUTCDate() + normalizedDays - 1,
+      23,
+      59,
+      59,
+      999,
+    ) - CHINA_TIME_OFFSET_MS;
+  return new Date(expiryUtcMs).toISOString();
+}
+
+function ownerIdFromReq(req) {
+  return req?.user?.id || "";
+}
+
+function isOwnedBy(item, ownerId) {
+  return Boolean(ownerId) && item?.owner_id === ownerId;
+}
+
+function ownerItems(list, ownerId) {
+  return (Array.isArray(list) ? list : []).filter((item) => isOwnedBy(item, ownerId));
+}
+
+function ownerGroups(ownerId) {
+  ensureDefaultGroupForOwner(ownerId);
+  return ownerItems(db.groups, ownerId);
+}
+
+function ownerWatchlist(ownerId) {
+  return ownerItems(db.watchlist, ownerId);
+}
+
+function ownerValuationHistory(ownerId) {
+  return ownerItems(db.valuation_history, ownerId);
+}
+
+function ensureDefaultGroupForOwner(ownerId) {
+  if (!ownerId) {
+    return false;
+  }
+  const exists = (db.groups || []).some((group) => group.id === "default" && group.owner_id === ownerId);
+  if (exists) {
+    return false;
+  }
+  const now = nowIso();
+  db.groups = Array.isArray(db.groups) ? db.groups : [];
+  db.groups.unshift({
+    id: "default",
+    owner_id: ownerId,
+    name: "默认股票池",
+    created_at: now,
+    updated_at: now,
+  });
+  return true;
+}
+
+function ensureLegacyOwnerData(ownerId) {
+  if (!ownerId) {
+    return false;
+  }
+  let changed = false;
+  const personalCollections = [
+    "groups",
+    "watchlist",
+    "valuation_history",
+    "sector_pool",
+    "short_strategy_monitors",
+    "decision_tests",
+    "company_analyses",
+    "valuations",
+  ];
+  for (const key of personalCollections) {
+    if (!Array.isArray(db[key])) {
+      continue;
+    }
+    for (const item of db[key]) {
+      if (!item.owner_id) {
+        item.owner_id = ownerId;
+        changed = true;
+      }
+    }
+  }
+  if (ensureDefaultGroupForOwner(ownerId)) {
+    changed = true;
+  }
+  return changed;
+}
+
+function removeUserOwnedData(ownerId) {
+  if (!ownerId) {
+    return;
+  }
+  const personalCollections = [
+    "groups",
+    "watchlist",
+    "valuation_history",
+    "sector_pool",
+    "short_strategy_monitors",
+    "decision_tests",
+    "company_analyses",
+    "valuations",
+  ];
+  for (const key of personalCollections) {
+    if (Array.isArray(db[key])) {
+      db[key] = db[key].filter((item) => item.owner_id !== ownerId);
+    }
+  }
 }
 
 function isAdminUser(user) {
@@ -315,16 +557,27 @@ function getAuthContext(req) {
   if (!user) {
     return { user: null, session: null };
   }
+  if (isUserExpired(user) || isUserLocked(user)) {
+    return { user: null, session: null };
+  }
+  if (session.device_id) {
+    const device = findLoginDevice(user.id, session.device_id);
+    if (!device) {
+      return { user: null, session: null };
+    }
+    device.last_seen_at = nowIso();
+  }
   return { user, session };
 }
 
-async function createAuthSession(user, req) {
+async function createAuthSession(user, req, deviceId = "") {
   const token = `${randomUUID()}.${randomBytes(24).toString("hex")}`;
   const now = nowIso();
   const expiresAt = new Date(Date.now() + AUTH_COOKIE_MAX_AGE * 1000).toISOString();
   const session = {
     id: randomUUID(),
     user_id: user.id,
+    device_id: deviceId,
     token_hash: hashSessionToken(token),
     created_at: now,
     last_seen_at: now,
@@ -363,6 +616,101 @@ function expiredAuthCookie() {
   return `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureCookieSuffix()}`;
 }
 
+function deviceCookie(deviceId) {
+  return `${DEVICE_COOKIE_NAME}=${encodeURIComponent(deviceId)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${DEVICE_COOKIE_MAX_AGE}${secureCookieSuffix()}`;
+}
+
+function normalizeDeviceId(value) {
+  const id = String(value || "").trim();
+  if (/^[a-f0-9-]{16,64}$/i.test(id)) {
+    return id;
+  }
+  return "";
+}
+
+function requestDeviceId(req) {
+  return normalizeDeviceId(getCookieValue(req, DEVICE_COOKIE_NAME));
+}
+
+function findLoginDevice(userId, deviceId) {
+  if (!userId || !deviceId) {
+    return null;
+  }
+  return (db.login_devices || []).find((device) => device.user_id === userId && device.id === deviceId) || null;
+}
+
+function activeLoginDevices(userId) {
+  if (!userId) {
+    return [];
+  }
+  return (db.login_devices || [])
+    .filter((device) => device.user_id === userId)
+    .sort((a, b) => String(b.last_seen_at || b.created_at || "").localeCompare(String(a.last_seen_at || a.created_at || "")));
+}
+
+function loginDeviceLabel(userAgent) {
+  const ua = String(userAgent || "");
+  const browser = /Edg\//.test(ua)
+    ? "Edge"
+    : /Chrome\//.test(ua)
+      ? "Chrome"
+      : /Firefox\//.test(ua)
+        ? "Firefox"
+        : /Safari\//.test(ua)
+          ? "Safari"
+          : "Browser";
+  const os = /Windows/i.test(ua)
+    ? "Windows"
+    : /Macintosh|Mac OS/i.test(ua)
+      ? "macOS"
+      : /Android/i.test(ua)
+        ? "Android"
+        : /iPhone|iPad/i.test(ua)
+          ? "iOS"
+          : /Linux/i.test(ua)
+            ? "Linux"
+            : "Device";
+  return `${browser} / ${os}`;
+}
+
+function upsertLoginDevice(user, req, deviceId) {
+  const id = normalizeDeviceId(deviceId) || randomUUID();
+  const now = nowIso();
+  const userAgent = String(req.headers["user-agent"] || "").slice(0, 500);
+  let device = findLoginDevice(user.id, id);
+  if (!device) {
+    device = {
+      id,
+      user_id: user.id,
+      username: user.username,
+      label: loginDeviceLabel(userAgent),
+      ip: clientIp(req),
+      user_agent: userAgent,
+      created_at: now,
+      last_seen_at: now,
+    };
+    db.login_devices = [device, ...(db.login_devices || [])];
+  } else {
+    device.username = user.username;
+    device.label = device.label || loginDeviceLabel(userAgent);
+    device.ip = clientIp(req);
+    device.user_agent = userAgent || device.user_agent || "";
+    device.last_seen_at = now;
+  }
+  return device;
+}
+
+function publicLoginDevice(device) {
+  return {
+    id: device.id,
+    label: device.label || loginDeviceLabel(device.user_agent),
+    ip: device.ip || "",
+    user_agent: device.user_agent || "",
+    created_at: device.created_at || "",
+    last_seen_at: device.last_seen_at || "",
+  };
+}
+
 async function handleAuthApi(req, res, url) {
   const segments = url.pathname.split("/").filter(Boolean);
 
@@ -378,13 +726,40 @@ async function handleAuthApi(req, res, url) {
     const body = await readJsonBody(req);
     const username = normalizeUsername(body.username);
     const user = (db.users || []).find((item) => normalizeUsername(item.username) === username);
-    if (!user || !verifyPassword(body.password, user)) {
+    if (!user) {
+      sendJson(res, 401, { error: "用户名或密码不正确" });
+      return true;
+    }
+    if (isUserExpired(user)) {
+      sendJson(res, 403, { error: "账号使用权已到期，请联系管理员" });
+      return true;
+    }
+    if (isUserLocked(user)) {
+      sendJson(res, 423, { error: "密码输入错误超过5次，请联系管理员" });
+      return true;
+    }
+    if (!verifyPassword(body.password, user)) {
+      const failedCount = registerFailedLogin(user, req);
+      await persistStore();
+      if (failedCount >= LOGIN_MAX_FAILED_ATTEMPTS) {
+        sendJson(res, 423, { error: "密码输入错误超过5次，请联系管理员" });
+        return true;
+      }
       sendJson(res, 401, { error: "用户名或密码不正确" });
       return true;
     }
 
     const now = nowIso();
-    const { token } = await createAuthSession(user, req);
+    const incomingDeviceId = requestDeviceId(req) || randomUUID();
+    const knownDevice = findLoginDevice(user.id, incomingDeviceId);
+    if (!knownDevice && activeLoginDevices(user.id).length >= LOGIN_MAX_DEVICE_COUNT) {
+      sendJson(res, 403, { error: "登录受限，该工具为内部产品，不允许在超过3个设备" });
+      return true;
+    }
+    const device = upsertLoginDevice(user, req, incomingDeviceId);
+    const { token } = await createAuthSession(user, req, device.id);
+    ensureDefaultGroupForOwner(user.id);
+    clearFailedLogin(user);
     user.last_login_at = now;
     user.updated_at = user.updated_at || now;
     db.login_events = [
@@ -400,7 +775,7 @@ async function handleAuthApi(req, res, url) {
     ].slice(0, 2000);
     await persistStore();
     sendJson(res, 200, { authenticated: true, user: publicUser(user) }, {
-      "Set-Cookie": authCookie(token),
+      "Set-Cookie": [authCookie(token), deviceCookie(device.id)],
     });
     return true;
   }
@@ -426,10 +801,33 @@ async function handleAuthApi(req, res, url) {
     const password = hashPassword(validatePassword(body.new_password));
     req.user.password_hash = password.passwordHash;
     req.user.password_salt = password.salt;
+    clearFailedLogin(req.user);
     req.user.updated_at = nowIso();
     db.sessions = (db.sessions || []).filter((session) => session.user_id !== req.user.id || session.id === req.session?.id);
     await persistStore();
     sendJson(res, 200, { user: publicUser(req.user) });
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/release-notice") {
+    const seenVersion = String(req.user.release_notice_seen_version || "");
+    sendJson(res, 200, {
+      ...RELEASE_NOTICE,
+      seen_version: seenVersion,
+      should_show: seenVersion !== RELEASE_NOTICE.version,
+    });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/release-notice/seen") {
+    req.user.release_notice_seen_version = RELEASE_NOTICE.version;
+    req.user.release_notice_seen_at = nowIso();
+    req.user.updated_at = nowIso();
+    await persistStore();
+    sendJson(res, 200, {
+      ok: true,
+      version: RELEASE_NOTICE.version,
+    });
     return true;
   }
 
@@ -465,18 +863,28 @@ async function handleUsersApi(req, res, segments) {
       throw badRequest("用户名已存在");
     }
     const password = hashPassword(validatePassword(body.password));
+    const role = body.role === "admin" ? "admin" : "user";
+    const validityDays = role === "admin"
+      ? null
+      : normalizeValidityDays(body.validity_days || body.validityDays || body.custom_validity_days || body.customValidityDays || 30);
     const now = nowIso();
     const user = {
       id: randomUUID(),
       username,
-      role: body.role === "admin" ? "admin" : "user",
+      role,
       password_hash: password.passwordHash,
       password_salt: password.salt,
+      validity_days: validityDays,
+      expires_at: role === "admin" ? "" : expiryFromValidityDays(validityDays),
+      failed_login_attempts: [],
+      failed_login_count: 0,
+      login_locked_at: "",
       created_at: now,
       updated_at: now,
       last_login_at: "",
     };
     db.users.push(user);
+    ensureDefaultGroupForOwner(user.id);
     await persistStore();
     sendJson(res, 201, { user: publicUser(user) });
     return;
@@ -496,6 +904,41 @@ async function handleUsersApi(req, res, segments) {
     return;
   }
 
+  if (req.method === "GET" && segments[3] === "devices") {
+    sendJson(res, 200, {
+      user: publicUser(user),
+      devices: activeLoginDevices(user.id).map(publicLoginDevice),
+    });
+    return;
+  }
+
+  if (req.method === "DELETE" && segments[3] === "devices" && segments[4]) {
+    const deviceId = decodeURIComponent(segments[4] || "");
+    const before = (db.login_devices || []).length;
+    db.login_devices = (db.login_devices || []).filter((device) => !(device.user_id === user.id && device.id === deviceId));
+    if (db.login_devices.length === before) {
+      throw notFound("登录设备不存在");
+    }
+    db.sessions = (db.sessions || []).filter((session) => !(session.user_id === user.id && session.device_id === deviceId));
+    await persistStore();
+    sendJson(res, 200, { ok: true, user: publicUser(user), devices: activeLoginDevices(user.id).map(publicLoginDevice) });
+    return;
+  }
+
+  if ((req.method === "PATCH" || req.method === "PUT") && segments[3] === "validity") {
+    if (isAdminUser(user)) {
+      throw badRequest("管理员账号不限制有效期");
+    }
+    const body = await readJsonBody(req);
+    const validityDays = normalizeValidityDays(body.validity_days || body.validityDays || body.days || 30);
+    user.validity_days = validityDays;
+    user.expires_at = expiryFromValidityDays(validityDays);
+    user.updated_at = nowIso();
+    await persistStore();
+    sendJson(res, 200, { user: publicUser(user) });
+    return;
+  }
+
   if (req.method === "POST" && segments[3] === "reset-password") {
     if (user.id === req.user.id) {
       throw badRequest("重置自己的密码请使用修改密码");
@@ -504,6 +947,7 @@ async function handleUsersApi(req, res, segments) {
     const password = hashPassword(validatePassword(body.password));
     user.password_hash = password.passwordHash;
     user.password_salt = password.salt;
+    clearFailedLogin(user);
     user.updated_at = nowIso();
     db.sessions = (db.sessions || []).filter((session) => session.user_id !== user.id);
     await persistStore();
@@ -519,8 +963,10 @@ async function handleUsersApi(req, res, segments) {
     if (user.role === "admin" && admins.length <= 1) {
       throw badRequest("至少保留一个管理员账号");
     }
+    removeUserOwnedData(user.id);
     db.users = db.users.filter((item) => item.id !== user.id);
     db.sessions = (db.sessions || []).filter((session) => session.user_id !== user.id);
+    db.login_devices = (db.login_devices || []).filter((device) => device.user_id !== user.id);
     await persistStore();
     sendJson(res, 200, { ok: true });
     return;
@@ -739,6 +1185,7 @@ function sendShareLoginPage(res, hasError) {
 
 async function handleApi(req, res, url) {
   const segments = url.pathname.split("/").filter(Boolean);
+  const ownerId = ownerIdFromReq(req);
 
   if (url.pathname === "/api/health") {
     sendJson(res, 200, {
@@ -759,18 +1206,18 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/dashboard") {
-    sendJson(res, 200, buildDashboard());
+    sendJson(res, 200, buildDashboard(ownerId));
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/api/groups") {
-    sendJson(res, 200, { groups: db.groups });
+    sendJson(res, 200, { groups: ownerGroups(ownerId) });
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/groups") {
     const body = await readJsonBody(req);
-    const group = await createGroup(body.name);
+    const group = await createGroup(ownerId, body.name);
     sendJson(res, 201, { group });
     return;
   }
@@ -779,25 +1226,25 @@ async function handleApi(req, res, url) {
     const groupId = decodeURIComponent(segments[2]);
     if (req.method === "PATCH") {
       const body = await readJsonBody(req);
-      const group = await updateGroup(groupId, body.name);
+      const group = await updateGroup(ownerId, groupId, body.name);
       sendJson(res, 200, { group });
       return;
     }
     if (req.method === "DELETE") {
-      await deleteGroup(groupId);
+      await deleteGroup(ownerId, groupId);
       sendJson(res, 200, { ok: true });
       return;
     }
   }
 
   if (req.method === "GET" && url.pathname === "/api/watchlist") {
-    sendJson(res, 200, { items: db.watchlist.map(enrichWatchItem) });
+    sendJson(res, 200, { items: ownerWatchlist(ownerId).map(enrichWatchItem) });
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/watchlist") {
     const body = await readJsonBody(req);
-    const item = await addWatchItem(body);
+    const item = await addWatchItem(ownerId, body);
     sendJson(res, 201, { item: enrichWatchItem(item) });
     return;
   }
@@ -805,31 +1252,31 @@ async function handleApi(req, res, url) {
   if (segments[1] === "watchlist" && segments[2]) {
     const itemId = decodeURIComponent(segments[2]);
     if (req.method === "GET") {
-      const detail = await getWatchItemDetail(itemId);
+      const detail = await getWatchItemDetail(ownerId, itemId);
       sendJson(res, 200, detail);
       return;
     }
     if (req.method === "PATCH") {
       const body = await readJsonBody(req);
-      const item = await updateWatchItem(itemId, body);
+      const item = await updateWatchItem(ownerId, itemId, body);
       sendJson(res, 200, { item: enrichWatchItem(item) });
       return;
     }
     if (req.method === "DELETE") {
-      await deleteWatchItem(itemId);
+      await deleteWatchItem(ownerId, itemId);
       sendJson(res, 200, { ok: true });
       return;
     }
   }
 
   if (req.method === "GET" && url.pathname === "/api/sector-pool") {
-    sendJson(res, 200, { items: db.sector_pool });
+    sendJson(res, 200, { items: ownerItems(db.sector_pool, ownerId).map(enrichSectorPoolItem) });
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/sector-pool") {
     const body = await readJsonBody(req);
-    const item = await addSectorPoolItem(body);
+    const item = await addSectorPoolItem(ownerId, body);
     sendJson(res, 201, { item });
     return;
   }
@@ -837,21 +1284,21 @@ async function handleApi(req, res, url) {
   if (segments[1] === "sector-pool" && segments[2]) {
     const itemId = decodeURIComponent(segments[2]);
     if (req.method === "DELETE") {
-      await deleteSectorPoolItem(itemId);
+      await deleteSectorPoolItem(ownerId, itemId);
       sendJson(res, 200, { ok: true });
       return;
     }
   }
 
   if (req.method === "GET" && url.pathname === "/api/decision-tests") {
-    const payload = await getDecisionTests();
+    const payload = await getDecisionTests(ownerId);
     sendJson(res, 200, payload);
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/decision-tests") {
     const body = await readJsonBody(req);
-    const item = await createDecisionTest(body);
+    const item = await createDecisionTest(ownerId, body);
     sendJson(res, 201, { item: await enrichDecisionTest(item) });
     return;
   }
@@ -859,21 +1306,21 @@ async function handleApi(req, res, url) {
   if (segments[1] === "decision-tests" && segments[2]) {
     const itemId = decodeURIComponent(segments[2]);
     if (req.method === "DELETE") {
-      await deleteDecisionTest(itemId);
+      await deleteDecisionTest(ownerId, itemId);
       sendJson(res, 200, { ok: true });
       return;
     }
   }
 
   if (req.method === "GET" && url.pathname === "/api/valuations") {
-    const payload = await getValuations();
+    const payload = await getValuations(ownerId);
     sendJson(res, 200, payload);
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/valuations") {
     const body = await readJsonBody(req);
-    const item = await createValuation(body);
+    const item = await createValuation(ownerId, body);
     sendJson(res, 201, { item });
     return;
   }
@@ -902,7 +1349,7 @@ async function handleApi(req, res, url) {
   if (segments[1] === "valuations" && segments[2]) {
     const valuationId = decodeURIComponent(segments[2]);
     if (req.method === "GET") {
-      const item = await getValuationDetail(valuationId);
+      const item = await getValuationDetail(ownerId, valuationId);
       sendJson(res, 200, { item });
       return;
     }
@@ -916,7 +1363,7 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && segments[1] === "stocks" && segments[2] && segments[3] === "detail") {
-    const detail = await getStockDetail(decodeURIComponent(segments[2]));
+    const detail = await getStockDetail(ownerId, decodeURIComponent(segments[2]));
     sendJson(res, 200, detail);
     return;
   }
@@ -924,13 +1371,13 @@ async function handleApi(req, res, url) {
   if (segments[1] === "stocks" && segments[2] && segments[3] === "analysis") {
     const identifier = decodeURIComponent(segments[2]);
     if (req.method === "GET") {
-      const payload = await getCompanyAnalysis(identifier);
+      const payload = await getCompanyAnalysis(ownerId, identifier);
       sendJson(res, 200, payload);
       return;
     }
     if (req.method === "POST") {
       const body = await readJsonBody(req);
-      const payload = await refreshCompanyAnalysis(identifier, body);
+      const payload = await refreshCompanyAnalysis(ownerId, identifier, body);
       sendJson(res, 201, payload);
       return;
     }
@@ -951,13 +1398,13 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/short-strategy-monitors") {
-    sendJson(res, 200, { items: getShortStrategyMonitors() });
+    sendJson(res, 200, { items: getShortStrategyMonitors(ownerId) });
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/short-strategy-monitors") {
     const body = await readJsonBody(req);
-    const item = await upsertShortStrategyMonitor(body);
+    const item = await upsertShortStrategyMonitor(ownerId, body);
     sendJson(res, 201, { item });
     return;
   }
@@ -965,7 +1412,7 @@ async function handleApi(req, res, url) {
   if (segments[1] === "short-strategy-monitors" && segments[2]) {
     const itemId = decodeURIComponent(segments[2]);
     if (req.method === "DELETE") {
-      await deleteShortStrategyMonitor(itemId);
+      await deleteShortStrategyMonitor(ownerId, itemId);
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -973,12 +1420,12 @@ async function handleApi(req, res, url) {
 
   if (req.method === "POST" && url.pathname === "/api/sync/start") {
     startSync("manual");
-    sendJson(res, 202, { sync: publicSyncState() });
+    sendJson(res, 202, { sync: publicSyncState(ownerId) });
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/api/sync/status") {
-    sendJson(res, 200, { sync: publicSyncState() });
+    sendJson(res, 200, { sync: publicSyncState(ownerId) });
     return;
   }
 
@@ -1023,6 +1470,16 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/sectors/strength-matrix") {
     const payload = await getSectorStrengthMatrix({
       level: url.searchParams.get("level") || "L3",
+      refresh: url.searchParams.get("refresh") === "1",
+    });
+    sendJson(res, 200, payload);
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/sectors/earnings-forecast") {
+    const payload = await getSectorEarningsForecast({
+      level: url.searchParams.get("level") || "L3",
+      days: Number(url.searchParams.get("days") || 30),
       refresh: url.searchParams.get("refresh") === "1",
     });
     sendJson(res, 200, payload);
@@ -1095,6 +1552,7 @@ function defaultStore() {
   const now = nowIso();
   return {
     version: 1,
+    auth_policy_version: 0,
     groups: [{
       id: "default",
       name: "默认股票池",
@@ -1103,6 +1561,7 @@ function defaultStore() {
     }],
     watchlist: [],
     valuation_history: [],
+    sector_meta: [],
     sector_pool: [],
     short_strategy_monitors: [],
     decision_tests: [],
@@ -1111,6 +1570,7 @@ function defaultStore() {
     users: [],
     login_events: [],
     sessions: [],
+    login_devices: [],
     prices: {},
     price_history: {},
     updated_at: now,
@@ -1130,6 +1590,7 @@ function normalizeStore(store) {
     groups,
     watchlist: Array.isArray(store.watchlist) ? store.watchlist : [],
     valuation_history: Array.isArray(store.valuation_history) ? store.valuation_history : [],
+    sector_meta: Array.isArray(store.sector_meta) ? store.sector_meta.map(normalizeSectorMetaRecord).filter(Boolean) : [],
     sector_pool: Array.isArray(store.sector_pool) ? store.sector_pool : [],
     short_strategy_monitors: Array.isArray(store.short_strategy_monitors) ? store.short_strategy_monitors : [],
     decision_tests: Array.isArray(store.decision_tests) ? store.decision_tests : [],
@@ -1138,8 +1599,43 @@ function normalizeStore(store) {
     users: Array.isArray(store.users) ? store.users : [],
     login_events: Array.isArray(store.login_events) ? store.login_events : [],
     sessions: Array.isArray(store.sessions) ? store.sessions : [],
+    login_devices: Array.isArray(store.login_devices) ? store.login_devices : [],
     prices: store.prices && typeof store.prices === "object" ? store.prices : {},
     price_history: store.price_history && typeof store.price_history === "object" ? store.price_history : {},
+  };
+}
+
+function normalizeSectorMetaRecord(record) {
+  if (!record || typeof record !== "object") {
+    return null;
+  }
+  const level = normalizeSectorLevel(record.level);
+  const code = cleanText(record.code || record.index_code);
+  const rawNames = record.names && typeof record.names === "object" ? record.names : {};
+  const nameZhCn = cleanText(record.name_zh_cn || rawNames["zh-CN"] || rawNames.zh_cn || record.name || record.source_name);
+  if (!code && !nameZhCn) {
+    return null;
+  }
+  const names = sectorMetaNames({
+    name_zh_cn: nameZhCn || code,
+    name_zh_tw: record.name_zh_tw || rawNames["zh-TW"] || rawNames.zh_tw,
+    name_en: record.name_en || rawNames.en,
+    name_ja: record.name_ja || rawNames.ja,
+  });
+  return {
+    id: sectorMetaId(level, code || nameZhCn),
+    level,
+    code,
+    source_name: cleanText(record.source_name || nameZhCn || code),
+    name_zh_cn: names["zh-CN"] || nameZhCn || code,
+    name_zh_tw: names["zh-TW"],
+    name_en: names.en,
+    name_ja: names.ja,
+    names,
+    aliases: Array.isArray(record.aliases) ? record.aliases.map(cleanText).filter(Boolean).slice(0, 12) : [],
+    source: cleanText(record.source) || "tushare_sw2021",
+    created_at: cleanText(record.created_at) || nowIso(),
+    updated_at: cleanText(record.updated_at) || nowIso(),
   };
 }
 
@@ -1154,13 +1650,13 @@ function persistStore() {
   return writeQueue;
 }
 
-async function createGroup(name) {
+async function createGroup(ownerId, name) {
   const cleanName = cleanText(name);
   if (!cleanName) {
     throw badRequest("分组名称不能为空");
   }
 
-  const existing = db.groups.find((group) => group.name === cleanName);
+  const existing = ownerGroups(ownerId).find((group) => group.name === cleanName);
   if (existing) {
     return existing;
   }
@@ -1168,6 +1664,7 @@ async function createGroup(name) {
   const now = nowIso();
   const group = {
     id: randomUUID(),
+    owner_id: ownerId,
     name: cleanName,
     created_at: now,
     updated_at: now,
@@ -1177,8 +1674,8 @@ async function createGroup(name) {
   return group;
 }
 
-async function updateGroup(groupId, name) {
-  const group = db.groups.find((item) => item.id === groupId);
+async function updateGroup(ownerId, groupId, name) {
+  const group = db.groups.find((item) => item.id === groupId && item.owner_id === ownerId);
   if (!group) {
     throw notFound("分组不存在");
   }
@@ -1194,17 +1691,17 @@ async function updateGroup(groupId, name) {
   return group;
 }
 
-async function deleteGroup(groupId) {
+async function deleteGroup(ownerId, groupId) {
   if (groupId === "default") {
     throw badRequest("默认分组不能删除");
   }
 
-  const index = db.groups.findIndex((item) => item.id === groupId);
+  const index = db.groups.findIndex((item) => item.id === groupId && item.owner_id === ownerId);
   if (index === -1) {
     throw notFound("分组不存在");
   }
 
-  const inUse = db.watchlist.some((item) => item.group_id === groupId);
+  const inUse = db.watchlist.some((item) => item.owner_id === ownerId && item.group_id === groupId);
   if (inUse) {
     const error = new Error("该分组下还有股票，不能删除");
     error.status = 409;
@@ -1215,24 +1712,25 @@ async function deleteGroup(groupId) {
   await persistStore();
 }
 
-async function addWatchItem(body) {
+async function addWatchItem(ownerId, body) {
   const tsCode = normalizeCode(body.ts_code || body.symbol || body.code);
   if (!tsCode) {
     throw badRequest("请选择要添加的股票");
   }
 
-  const existing = db.watchlist.find((item) => item.ts_code === tsCode);
+  const existing = db.watchlist.find((item) => item.owner_id === ownerId && item.ts_code === tsCode);
   if (existing) {
     scheduleCompanyAnalysisForWatchItem(existing, "watchlist-existing");
     return existing;
   }
 
   const stock = await findStock(tsCode);
-  const latestValuation = latestSavedValuation(tsCode);
-  const groupId = db.groups.some((group) => group.id === body.group_id) ? body.group_id : "default";
+  const latestValuation = latestSavedValuation(ownerId, tsCode);
+  const groupId = ownerGroups(ownerId).some((group) => group.id === body.group_id) ? body.group_id : "default";
   const now = nowIso();
   const item = {
     id: randomUUID(),
+    owner_id: ownerId,
     ts_code: stock.ts_code,
     symbol: stock.symbol || stock.ts_code.slice(0, 6),
     name: stock.name || stock.ts_code,
@@ -1258,13 +1756,13 @@ async function addWatchItem(body) {
   return item;
 }
 
-async function updateWatchItem(itemId, body) {
-  const item = findWatchItem(itemId);
+async function updateWatchItem(ownerId, itemId, body) {
+  const item = findWatchItem(ownerId, itemId);
   const oldValuation = pickValuation(item);
   const oldBasis = item.valuation_basis || "";
 
   if ("group_id" in body) {
-    item.group_id = db.groups.some((group) => group.id === body.group_id) ? body.group_id : "default";
+    item.group_id = ownerGroups(ownerId).some((group) => group.id === body.group_id) ? body.group_id : "default";
   }
   if ("note" in body) {
     item.note = cleanText(body.note);
@@ -1291,6 +1789,7 @@ async function updateWatchItem(itemId, body) {
     item.valuation_updated_at = now;
     db.valuation_history.unshift({
       id: randomUUID(),
+      owner_id: ownerId,
       watchlist_id: item.id,
       ts_code: item.ts_code,
       stock_name: item.name,
@@ -1312,48 +1811,52 @@ async function updateWatchItem(itemId, body) {
   return item;
 }
 
-async function deleteWatchItem(itemId) {
-  const item = findWatchItem(itemId);
+async function deleteWatchItem(ownerId, itemId) {
+  const item = findWatchItem(ownerId, itemId);
   db.watchlist = db.watchlist.filter((entry) => entry.id !== item.id);
   await persistStore();
 }
 
-async function addSectorPoolItem(body) {
+async function addSectorPoolItem(ownerId, body) {
   const level = normalizeSectorLevel(body.level || "L3");
   const code = cleanText(body.code || body.index_code);
-  const name = cleanText(body.name || body.industry_name || code);
+  const storedMeta = findSectorMeta(level, code);
+  const name = cleanText(storedMeta?.name_zh_cn || body.name || body.industry_name || code);
   if (!name && !code) {
     throw badRequest("请选择要添加的板块");
   }
 
   const id = sectorPoolKey(level, code, name);
-  const existing = db.sector_pool.find((item) => item.id === id);
+  const existing = db.sector_pool.find((item) => item.owner_id === ownerId && item.id === id);
   if (existing) {
     existing.name = name || existing.name;
     existing.code = code || existing.code;
     existing.level = level;
+    existing.names = sectorMetaNames(storedMeta || upsertSectorMeta({ level, code, name }));
     existing.updated_at = nowIso();
     await persistStore();
-    return existing;
+    return enrichSectorPoolItem(existing);
   }
 
   const now = nowIso();
   const item = {
     id,
+    owner_id: ownerId,
     code,
     name: name || code,
     level,
+    names: sectorMetaNames(storedMeta || upsertSectorMeta({ level, code, name })),
     created_at: now,
     updated_at: now,
   };
   db.sector_pool.push(item);
   db.sector_pool.sort((a, b) => `${a.level}:${a.name}`.localeCompare(`${b.level}:${b.name}`, "zh-CN"));
   await persistStore();
-  return item;
+  return enrichSectorPoolItem(item);
 }
 
-async function deleteSectorPoolItem(itemId) {
-  const index = db.sector_pool.findIndex((item) => item.id === itemId);
+async function deleteSectorPoolItem(ownerId, itemId) {
+  const index = db.sector_pool.findIndex((item) => item.owner_id === ownerId && item.id === itemId);
   if (index === -1) {
     throw notFound("板块池中没有这个板块");
   }
@@ -1361,13 +1864,13 @@ async function deleteSectorPoolItem(itemId) {
   await persistStore();
 }
 
-function getShortStrategyMonitors() {
-  return (db.short_strategy_monitors || [])
+function getShortStrategyMonitors(ownerId) {
+  return ownerItems(db.short_strategy_monitors, ownerId)
     .slice()
     .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
 }
 
-async function upsertShortStrategyMonitor(body) {
+async function upsertShortStrategyMonitor(ownerId, body) {
   const source = body && typeof body === "object" ? body : {};
   const snapshot = source.snapshot && typeof source.snapshot === "object" ? source.snapshot : source;
   const tsCode = normalizeCode(source.ts_code || source.tsCode || snapshot.ts_code || snapshot.tsCode);
@@ -1377,10 +1880,11 @@ async function upsertShortStrategyMonitor(body) {
 
   const now = nowIso();
   db.short_strategy_monitors = Array.isArray(db.short_strategy_monitors) ? db.short_strategy_monitors : [];
-  let item = db.short_strategy_monitors.find((entry) => entry.ts_code === tsCode);
+  let item = db.short_strategy_monitors.find((entry) => entry.owner_id === ownerId && entry.ts_code === tsCode);
   if (!item) {
     item = {
       id: randomUUID(),
+      owner_id: ownerId,
       ts_code: tsCode,
       created_at: now,
     };
@@ -1452,9 +1956,10 @@ async function upsertShortStrategyMonitor(body) {
   return item;
 }
 
-async function deleteShortStrategyMonitor(itemId) {
+async function deleteShortStrategyMonitor(ownerId, itemId) {
   const normalized = normalizeCode(itemId);
-  const index = (db.short_strategy_monitors || []).findIndex((item) => item.id === itemId || (normalized && item.ts_code === normalized));
+  const index = (db.short_strategy_monitors || [])
+    .findIndex((item) => item.owner_id === ownerId && (item.id === itemId || (normalized && item.ts_code === normalized)));
   if (index === -1) {
     throw notFound("短线监控列表中没有这只股票");
   }
@@ -1462,23 +1967,23 @@ async function deleteShortStrategyMonitor(itemId) {
   await persistStore();
 }
 
-async function getValuations() {
+async function getValuations(ownerId) {
   return {
-    items: (db.valuations || [])
+    items: ownerItems(db.valuations, ownerId)
       .slice()
       .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || ""))),
   };
 }
 
-async function getValuationDetail(valuationId) {
-  const item = (db.valuations || []).find((entry) => entry.id === valuationId);
+async function getValuationDetail(ownerId, valuationId) {
+  const item = (db.valuations || []).find((entry) => entry.owner_id === ownerId && entry.id === valuationId);
   if (!item) {
     throw notFound("没有找到这条估值记录");
   }
   return item;
 }
 
-async function createValuation(body) {
+async function createValuation(ownerId, body) {
   const stock = await resolveStockInput(body.ts_code || body.symbol || body.code || body.name || body.stock_name || body.company_name);
   if (!stock?.ts_code) {
     throw badRequest("请输入股票名称");
@@ -1497,6 +2002,7 @@ async function createValuation(body) {
 
   const item = {
     id: randomUUID(),
+    owner_id: ownerId,
     ts_code: stock.ts_code,
     symbol: stock.symbol || stock.ts_code.slice(0, 6),
     name: stock.name || stock.ts_code,
@@ -1585,7 +2091,7 @@ async function predictValuationAssumptions(body) {
   const terminalGrowth = normalizeAssumptionPercent(result.terminal_growth_rate ?? result.terminalGrowthRate, -1, 6);
   const discountRate = normalizeAssumptionPercent(result.discount_rate ?? result.discountRate ?? result.wacc, 5, 20);
   if (!Number.isFinite(Number(terminalGrowth)) || !Number.isFinite(Number(discountRate))) {
-    throw badGateway("Gemini 没有返回有效的永续增长率或折现率");
+    throw badGateway("AI 没有返回有效的永续增长率或折现率");
   }
   const safeTerminalGrowth = Math.min(terminalGrowth, discountRate - 1);
   return {
@@ -1950,9 +2456,9 @@ function valuationMethodKeys() {
   return ["dcf", "ddm", "pe", "peg", "ev_ebitda"];
 }
 
-function latestSavedValuation(tsCode) {
+function latestSavedValuation(ownerId, tsCode) {
   const normalized = normalizeCode(tsCode);
-  return (db.valuations || [])
+  return ownerItems(db.valuations, ownerId)
     .filter((entry) => entry.ts_code === normalized && Number.isFinite(Number(entry.fair_price)))
     .slice()
     .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))[0] || null;
@@ -2006,9 +2512,9 @@ function normalizeValuationExtractPayload(payload) {
   };
 }
 
-async function getDecisionTests() {
-  await repairDecisionStockInputs();
-  const source = db.decision_tests
+async function getDecisionTests(ownerId) {
+  await repairDecisionStockInputs(ownerId);
+  const source = ownerItems(db.decision_tests, ownerId)
     .slice()
     .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
   const items = await mapWithConcurrency(source, 4, enrichDecisionTest);
@@ -2018,7 +2524,7 @@ async function getDecisionTests() {
   };
 }
 
-async function createDecisionTest(body) {
+async function createDecisionTest(ownerId, body) {
   const stock = await resolveStockInput(body.ts_code || body.symbol || body.code);
   if (!stock?.ts_code) {
     throw badRequest("请输入要验证的股票代码");
@@ -2033,6 +2539,7 @@ async function createDecisionTest(body) {
   const now = nowIso();
   const item = {
     id: randomUUID(),
+    owner_id: ownerId,
     mode,
     ts_code: stock.ts_code,
     symbol: stock.symbol || stock.ts_code.slice(0, 6),
@@ -2054,8 +2561,8 @@ async function createDecisionTest(body) {
   return item;
 }
 
-async function deleteDecisionTest(itemId) {
-  const index = db.decision_tests.findIndex((item) => item.id === itemId);
+async function deleteDecisionTest(ownerId, itemId) {
+  const index = db.decision_tests.findIndex((item) => item.owner_id === ownerId && item.id === itemId);
   if (index === -1) {
     throw notFound("没有找到这条决策验证");
   }
@@ -2063,9 +2570,9 @@ async function deleteDecisionTest(itemId) {
   await persistStore();
 }
 
-async function repairDecisionStockInputs() {
+async function repairDecisionStockInputs(ownerId) {
   let changed = false;
-  for (const item of db.decision_tests || []) {
+  for (const item of ownerItems(db.decision_tests, ownerId)) {
     if (/^\d{6}\.(SH|SZ|BJ)$/.test(String(item.ts_code || ""))) {
       continue;
     }
@@ -2343,21 +2850,297 @@ function sectorPoolKey(level, code, name) {
   return `${normalizeSectorLevel(level)}:${cleanText(code || name)}`;
 }
 
-function findWatchItem(itemId) {
-  const item = findWatchItemMaybe(itemId);
+function sectorMetaId(level, codeOrName) {
+  return `${normalizeSectorLevel(level)}:${cleanText(codeOrName)}`;
+}
+
+function findSectorMeta(level, code, name = "") {
+  const normalizedLevel = normalizeSectorLevel(level);
+  const cleanCode = cleanText(code);
+  const cleanName = cleanText(name);
+  return (db.sector_meta || []).find((item) => (
+    item.level === normalizedLevel
+    && ((cleanCode && item.code === cleanCode) || (cleanName && item.name_zh_cn === cleanName))
+  )) || null;
+}
+
+function sectorMetaNames(record) {
+  const nameZhCn = cleanText(record?.name_zh_cn || record?.name || record?.source_name || record?.code);
+  const generated = buildSectorNameTranslations(nameZhCn);
+  return {
+    "zh-CN": nameZhCn,
+    "zh-TW": cleanText(record?.name_zh_tw || record?.names?.["zh-TW"] || record?.names?.zh_tw) || generated["zh-TW"] || nameZhCn,
+    en: cleanText(record?.name_en || record?.names?.en) || generated.en || nameZhCn,
+    ja: cleanText(record?.name_ja || record?.names?.ja) || generated.ja || nameZhCn,
+  };
+}
+
+function upsertSectorMeta(sector) {
+  const level = normalizeSectorLevel(sector.level);
+  const code = cleanText(sector.code);
+  const name = cleanText(sector.name || sector.name_zh_cn || sector.source_name || code);
+  const id = sectorMetaId(level, code || name);
+  let record = (db.sector_meta || []).find((item) => item.id === id);
+  const now = nowIso();
+  if (!record) {
+    record = normalizeSectorMetaRecord({
+      id,
+      level,
+      code,
+      name_zh_cn: name,
+      source_name: name,
+      source: sector.source || "tushare_sw2021",
+      created_at: now,
+      updated_at: now,
+    });
+    db.sector_meta.push(record);
+    return record;
+  }
+
+  let changed = false;
+  if (code && record.code !== code) {
+    record.code = code;
+    changed = true;
+  }
+  if (name && record.name_zh_cn !== name) {
+    record.name_zh_cn = name;
+    record.source_name = name;
+    changed = true;
+  }
+  const names = sectorMetaNames(record);
+  record.names = { ...(record.names || {}), ...names };
+  record.name_zh_tw = record.names["zh-TW"];
+  record.name_en = record.names.en;
+  record.name_ja = record.names.ja;
+  if (changed) {
+    record.updated_at = now;
+  }
+  return record;
+}
+
+function enrichSectorWithMeta(sector) {
+  const record = findSectorMeta(sector.level, sector.code, sector.name) || upsertSectorMeta(sector);
+  const names = sectorMetaNames(record);
+  return {
+    ...sector,
+    name: record.name_zh_cn || sector.name,
+    source_name: record.source_name || sector.name,
+    display_name: record.name_zh_cn || sector.name,
+    name_zh_cn: record.name_zh_cn || sector.name,
+    name_zh_tw: names["zh-TW"],
+    name_en: names.en,
+    name_ja: names.ja,
+    names,
+  };
+}
+
+function enrichSectorPoolItem(item) {
+  const record = findSectorMeta(item.level, item.code, item.name);
+  if (!record) {
+    return {
+      ...item,
+      names: sectorMetaNames(item),
+      display_name: item.name || item.code,
+    };
+  }
+  const names = sectorMetaNames(record);
+  return {
+    ...item,
+    name: record.name_zh_cn || item.name,
+    display_name: record.name_zh_cn || item.name,
+    names,
+  };
+}
+
+function sectorPublicFields(sector) {
+  const enriched = enrichSectorWithMeta(sector);
+  return {
+    code: enriched.code,
+    name: enriched.name,
+    level: enriched.level,
+    source_name: enriched.source_name,
+    display_name: enriched.display_name,
+    names: enriched.names,
+    member_search: Array.isArray(enriched.member_search) ? enriched.member_search : [],
+  };
+}
+
+function withSectorMemberSearch(sectorMeta, sector) {
+  const members = sectorMeta?.sectorMembers?.get(sector.code) || [];
+  return {
+    ...sector,
+    member_search: members.map((member) => ({
+      ts_code: member.ts_code,
+      name: member.name,
+    })),
+  };
+}
+
+async function syncSectorMetadata(levels) {
+  const before = JSON.stringify((db.sector_meta || []).map((item) => [
+    item.id,
+    item.name_zh_cn,
+    item.name_zh_tw,
+    item.name_en,
+    item.name_ja,
+  ]));
+  for (const meta of Object.values(levels || {})) {
+    for (const sector of meta.sectorByCode.values()) {
+      upsertSectorMeta(sector);
+    }
+  }
+  db.sector_meta.sort((a, b) => `${a.level}:${a.code || a.name_zh_cn}`.localeCompare(`${b.level}:${b.code || b.name_zh_cn}`, "zh-CN"));
+  const after = JSON.stringify((db.sector_meta || []).map((item) => [
+    item.id,
+    item.name_zh_cn,
+    item.name_zh_tw,
+    item.name_en,
+    item.name_ja,
+  ]));
+  if (before !== after) {
+    await persistStore();
+  }
+}
+
+function buildSectorNameTranslations(name) {
+  const cleanName = cleanText(name);
+  if (!cleanName) {
+    return { "zh-TW": "", en: "", ja: "" };
+  }
+  return {
+    "zh-TW": replaceSectorNameByTerms(cleanName, sectorTraditionalTerms(), cleanName),
+    en: replaceSectorNameByTerms(cleanName, sectorEnglishTerms(), `${cleanName} Sector`),
+    ja: replaceSectorNameByTerms(cleanName, sectorJapaneseTerms(), `${cleanName}セクター`),
+  };
+}
+
+function replaceSectorNameByTerms(name, terms, fallback) {
+  let text = cleanText(name);
+  if (!text) {
+    return "";
+  }
+  let changed = false;
+  for (const [source, target] of terms) {
+    if (text.includes(source)) {
+      text = text.split(source).join(target);
+      changed = true;
+    }
+  }
+  if (!changed) {
+    return fallback;
+  }
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function sectorTraditionalTerms() {
+  return [
+    ["消费", "消費"], ["制造", "製造"], ["设备", "設備"], ["电子", "電子"], ["电力", "電力"],
+    ["电池", "電池"], ["电网", "電網"], ["电器", "電器"], ["电脑", "電腦"], ["汽车", "汽車"],
+    ["车", "車"], ["机械", "機械"], ["计算机", "計算機"], ["通信", "通信"], ["传媒", "傳媒"],
+    ["医药", "醫藥"], ["医疗", "醫療"], ["银行", "銀行"], ["证券", "證券"], ["地产", "地產"],
+    ["建筑", "建築"], ["材料", "材料"], ["化学", "化學"], ["基础", "基礎"], ["农", "農"],
+    ["林", "林"], ["牧", "牧"], ["渔", "漁"], ["轻工", "輕工"], ["纺织", "紡織"],
+    ["服饰", "服飾"], ["食品", "食品"], ["饮料", "飲料"], ["国防", "國防"], ["军工", "軍工"],
+    ["综合", "綜合"], ["环保", "環保"], ["运输", "運輸"], ["软件", "軟體"], ["游戏", "遊戲"],
+    ["服务", "服務"], ["旅游", "旅遊"], ["酒店", "酒店"], ["教育", "教育"], ["美容", "美容"],
+    ["护理", "護理"], ["有色", "有色"], ["煤炭", "煤炭"], ["石油", "石油"], ["钢铁", "鋼鐵"],
+    ["贵金属", "貴金屬"], ["能源", "能源"], ["金属", "金屬"], ["光伏", "光伏"], ["储能", "儲能"],
+  ].sort((a, b) => b[0].length - a[0].length);
+}
+
+function sectorEnglishTerms() {
+  return [
+    ["品牌消费电子", "Branded Consumer Electronics"], ["消费电子", "Consumer Electronics"],
+    ["集成电路制造", "Integrated Circuit Manufacturing"], ["半导体设备", "Semiconductor Equipment"],
+    ["半导体材料", "Semiconductor Materials"], ["数字芯片设计", "Digital Chip Design"],
+    ["模拟芯片设计", "Analog Chip Design"], ["军工电子", "Defense Electronics"],
+    ["光伏设备", "Photovoltaic Equipment"], ["储能设备", "Energy Storage Equipment"],
+    ["电网设备", "Power Grid Equipment"], ["风电设备", "Wind Power Equipment"],
+    ["电池", "Battery"], ["电力设备", "Power Equipment"], ["电力", "Power"],
+    ["工程机械", "Construction Machinery"], ["自动化设备", "Automation Equipment"],
+    ["通用设备", "General Equipment"], ["专用设备", "Specialized Equipment"], ["机械设备", "Machinery"],
+    ["汽车零部件", "Auto Parts"], ["乘用车", "Passenger Vehicles"], ["商用车", "Commercial Vehicles"], ["汽车", "Automobiles"],
+    ["白色家电", "White Goods"], ["家用电器", "Home Appliances"], ["食品加工", "Food Processing"],
+    ["白酒", "Baijiu"], ["啤酒", "Beer"], ["饮料乳品", "Beverage and Dairy"], ["食品饮料", "Food and Beverage"],
+    ["化学制药", "Chemical Pharmaceuticals"], ["生物制品", "Biological Products"], ["医疗器械", "Medical Devices"],
+    ["医疗服务", "Medical Services"], ["医药生物", "Pharmaceuticals and Biotechnology"], ["中药", "Traditional Chinese Medicine"],
+    ["软件开发", "Software Development"], ["IT服务", "IT Services"], ["通信设备", "Communication Equipment"],
+    ["计算机", "Computer"], ["传媒", "Media"], ["通信", "Communications"],
+    ["游戏", "Games"], ["广告营销", "Advertising and Marketing"], ["影视院线", "Film and Cinema"],
+    ["证券", "Securities"], ["保险", "Insurance"], ["银行", "Banking"], ["非银金融", "Non-bank Financials"],
+    ["房地产开发", "Real Estate Development"], ["物业管理", "Property Management"], ["房地产", "Real Estate"],
+    ["航空机场", "Airlines and Airports"], ["航运港口", "Shipping and Ports"], ["物流", "Logistics"],
+    ["交通运输", "Transportation"], ["铁路公路", "Railway and Highway"], ["煤炭开采", "Coal Mining"],
+    ["油气开采", "Oil and Gas Exploration"], ["石油石化", "Petroleum and Petrochemicals"],
+    ["农产品加工", "Agricultural Product Processing"], ["养殖业", "Breeding"], ["种植业", "Planting"],
+    ["饲料", "Feed"], ["林业", "Forestry"], ["水产养殖", "Aquaculture"], ["农林牧渔", "Agriculture and Fishery"],
+    ["贵金属", "Precious Metals"], ["工业金属", "Industrial Metals"], ["小金属", "Minor Metals"],
+    ["能源金属", "Energy Metals"], ["有色金属", "Non-ferrous Metals"], ["钢铁", "Steel"],
+    ["水泥", "Cement"], ["玻璃", "Glass"], ["建筑材料", "Building Materials"], ["建筑装饰", "Building Decoration"],
+    ["化学原料", "Chemical Raw Materials"], ["化学制品", "Chemical Products"], ["基础化工", "Basic Chemicals"],
+    ["塑料", "Plastics"], ["橡胶", "Rubber"], ["纺织制造", "Textile Manufacturing"],
+    ["服装家纺", "Apparel and Home Textiles"], ["纺织服饰", "Textile and Apparel"],
+    ["造纸", "Papermaking"], ["包装印刷", "Packaging and Printing"], ["家居用品", "Household Goods"],
+    ["轻工制造", "Light Manufacturing"], ["专业服务", "Professional Services"], ["旅游及景区", "Tourism and Scenic Spots"],
+    ["酒店餐饮", "Hotels and Catering"], ["教育", "Education"], ["美容护理", "Beauty Care"],
+    ["环保", "Environmental Protection"], ["公用事业", "Utilities"], ["燃气", "Gas"], ["水务", "Water Utilities"],
+    ["国防军工", "Defense Industry"], ["电子", "Electronics"], ["商贸零售", "Commerce and Retail"],
+    ["社会服务", "Social Services"], ["综合", "Conglomerates"],
+  ].sort((a, b) => b[0].length - a[0].length);
+}
+
+function sectorJapaneseTerms() {
+  return [
+    ["品牌消费电子", "ブランド消費電子"], ["消费电子", "消費電子"],
+    ["集成电路制造", "集積回路製造"], ["半导体设备", "半導体装置"],
+    ["半导体材料", "半導体材料"], ["数字芯片设计", "デジタルチップ設計"],
+    ["模拟芯片设计", "アナログチップ設計"], ["军工电子", "防衛電子"],
+    ["光伏设备", "太陽光発電設備"], ["储能设备", "蓄電設備"], ["电网设备", "送配電設備"],
+    ["风电设备", "風力発電設備"], ["电池", "電池"], ["电力设备", "電力設備"], ["电力", "電力"],
+    ["工程机械", "建設機械"], ["自动化设备", "自動化設備"], ["通用设备", "汎用設備"],
+    ["专用设备", "専用設備"], ["机械设备", "機械設備"],
+    ["汽车零部件", "自動車部品"], ["乘用车", "乗用車"], ["商用车", "商用車"], ["汽车", "自動車"],
+    ["食品加工", "食品加工"], ["白酒", "白酒"], ["啤酒", "ビール"], ["饮料乳品", "飲料・乳製品"],
+    ["食品饮料", "食品・飲料"], ["化学制药", "化学医薬"], ["生物制品", "バイオ製品"],
+    ["医疗器械", "医療機器"], ["医疗服务", "医療サービス"], ["医药生物", "医薬・バイオ"],
+    ["中药", "漢方薬"], ["软件开发", "ソフトウェア開発"], ["IT服务", "ITサービス"],
+    ["通信设备", "通信設備"], ["计算机", "コンピューター"], ["传媒", "メディア"], ["通信", "通信"],
+    ["游戏", "ゲーム"], ["广告营销", "広告マーケティング"], ["证券", "証券"], ["保险", "保険"],
+    ["银行", "銀行"], ["非银金融", "ノンバンク金融"], ["房地产开发", "不動産開発"],
+    ["物业管理", "不動産管理"], ["房地产", "不動産"], ["航空机场", "航空・空港"],
+    ["航运港口", "海運・港湾"], ["物流", "物流"], ["交通运输", "運輸"], ["铁路公路", "鉄道・道路"],
+    ["煤炭开采", "石炭採掘"], ["油气开采", "石油ガス採掘"], ["石油石化", "石油化学"],
+    ["农产品加工", "農産物加工"], ["养殖业", "養殖"], ["种植业", "栽培"], ["饲料", "飼料"],
+    ["林业", "林業"], ["水产养殖", "水産養殖"], ["农林牧渔", "農林畜水産"],
+    ["贵金属", "貴金属"], ["工业金属", "工業金属"], ["小金属", "レアメタル"],
+    ["能源金属", "エネルギー金属"], ["有色金属", "非鉄金属"], ["钢铁", "鉄鋼"],
+    ["水泥", "セメント"], ["玻璃", "ガラス"], ["建筑材料", "建材"], ["建筑装饰", "建築装飾"],
+    ["化学原料", "化学原料"], ["化学制品", "化学製品"], ["基础化工", "基礎化学"],
+    ["塑料", "プラスチック"], ["橡胶", "ゴム"], ["纺织制造", "繊維製造"],
+    ["服装家纺", "アパレル・ホームテキスタイル"], ["纺织服饰", "繊維アパレル"],
+    ["造纸", "製紙"], ["包装印刷", "包装印刷"], ["家居用品", "家庭用品"], ["轻工制造", "軽工業"],
+    ["专业服务", "専門サービス"], ["旅游及景区", "観光・景勝地"], ["酒店餐饮", "ホテル・外食"],
+    ["教育", "教育"], ["美容护理", "美容ケア"], ["环保", "環境保護"], ["公用事业", "公益事業"],
+    ["燃气", "ガス"], ["水务", "水道"], ["国防军工", "防衛産業"], ["电子", "電子"],
+    ["商贸零售", "商業・小売"], ["社会服务", "社会サービス"], ["综合", "総合"],
+  ].sort((a, b) => b[0].length - a[0].length);
+}
+
+function findWatchItem(ownerId, itemId) {
+  const item = findWatchItemMaybe(ownerId, itemId);
   if (!item) {
     throw notFound("股票池中没有这只股票");
   }
   return item;
 }
 
-function findWatchItemMaybe(itemId) {
+function findWatchItemMaybe(ownerId, itemId) {
   const normalized = normalizeCode(itemId);
-  return db.watchlist.find((entry) => entry.id === itemId || (normalized && entry.ts_code === normalized)) || null;
+  return db.watchlist.find((entry) => entry.owner_id === ownerId && (entry.id === itemId || (normalized && entry.ts_code === normalized))) || null;
 }
 
-async function getWatchItemDetail(itemId) {
-  const item = findWatchItem(itemId);
+async function getWatchItemDetail(ownerId, itemId) {
+  const item = findWatchItem(ownerId, itemId);
   const reportsResult = await getReports(item.ts_code).catch((error) => ({
     reports: [],
     reportError: error.message,
@@ -2366,23 +3149,23 @@ async function getWatchItemDetail(itemId) {
   return {
     item: enrichWatchItem(item),
     history: (db.price_history[item.ts_code] || []).slice(0, 180),
-    valuation_history: db.valuation_history
+    valuation_history: ownerValuationHistory(ownerId)
       .filter((entry) => entry.watchlist_id === item.id || entry.ts_code === item.ts_code)
       .slice(0, 80),
     reports: reportsResult.reports || [],
     reportError: reportsResult.reportError || "",
     links: buildInfoLinks(item),
-    company_analysis_latest: latestCompanyAnalysis(item.ts_code),
-    company_analysis_history: companyAnalysisHistory(item.ts_code),
-    company_analysis_status: companyAnalysisStatus(item.ts_code),
+    company_analysis_latest: latestCompanyAnalysis(ownerId, item.ts_code),
+    company_analysis_history: companyAnalysisHistory(ownerId, item.ts_code),
+    company_analysis_status: companyAnalysisStatus(ownerId, item.ts_code),
     in_watchlist: true,
   };
 }
 
-async function getStockDetail(identifier) {
-  const watchItem = findWatchItemMaybe(identifier);
+async function getStockDetail(ownerId, identifier) {
+  const watchItem = findWatchItemMaybe(ownerId, identifier);
   if (watchItem) {
-    return getWatchItemDetail(watchItem.id);
+    return getWatchItemDetail(ownerId, watchItem.id);
   }
 
   const tsCode = normalizeCode(identifier);
@@ -2405,38 +3188,38 @@ async function getStockDetail(identifier) {
     reports: reportsResult.reports || [],
     reportError: reportsResult.reportError || "",
     links: buildInfoLinks(item),
-    company_analysis_latest: latestCompanyAnalysis(item.ts_code),
-    company_analysis_history: companyAnalysisHistory(item.ts_code),
-    company_analysis_status: companyAnalysisStatus(item.ts_code),
+    company_analysis_latest: latestCompanyAnalysis(ownerId, item.ts_code),
+    company_analysis_history: companyAnalysisHistory(ownerId, item.ts_code),
+    company_analysis_status: companyAnalysisStatus(ownerId, item.ts_code),
     in_watchlist: false,
   };
 }
 
-async function getCompanyAnalysis(identifier) {
-  const stock = await resolveStockForAnalysis(identifier);
+async function getCompanyAnalysis(ownerId, identifier) {
+  const stock = await resolveStockForAnalysis(ownerId, identifier);
   return {
-    latest: latestCompanyAnalysis(stock.ts_code),
-    history: companyAnalysisHistory(stock.ts_code),
-    status: companyAnalysisStatus(stock.ts_code),
+    latest: latestCompanyAnalysis(ownerId, stock.ts_code),
+    history: companyAnalysisHistory(ownerId, stock.ts_code),
+    status: companyAnalysisStatus(ownerId, stock.ts_code),
   };
 }
 
-async function refreshCompanyAnalysis(identifier, body = {}) {
+async function refreshCompanyAnalysis(ownerId, identifier, body = {}) {
   if (!GEMINI_API_KEY) {
     throw badRequest("缺少 GEMINI_API_KEY，请检查 .env");
   }
 
-  const stock = await resolveStockForAnalysis(identifier);
+  const stock = await resolveStockForAnalysis(ownerId, identifier);
   const inputCompanyName = cleanText(body.company_name) || stock.name || stock.ts_code;
-  const record = await createCompanyAnalysisRecord(stock, inputCompanyName);
+  const record = await createCompanyAnalysisRecord(ownerId, stock, inputCompanyName);
   return {
     latest: record,
-    history: companyAnalysisHistory(stock.ts_code),
-    status: companyAnalysisStatus(stock.ts_code),
+    history: companyAnalysisHistory(ownerId, stock.ts_code),
+    status: companyAnalysisStatus(ownerId, stock.ts_code),
   };
 }
 
-async function createCompanyAnalysisRecord(stock, inputCompanyName) {
+async function createCompanyAnalysisRecord(ownerId, stock, inputCompanyName) {
   const promptCompanyName = cleanText(inputCompanyName) || stock.name || stock.ts_code;
   const prompt = buildCompanyAnalysisPrompt(promptCompanyName);
   const analysis = normalizeCompanyAnalysisPayload(
@@ -2445,6 +3228,7 @@ async function createCompanyAnalysisRecord(stock, inputCompanyName) {
   );
   const record = {
     id: randomUUID(),
+    owner_id: ownerId,
     ts_code: stock.ts_code,
     stock_name: stock.name || stock.ts_code,
     input_company_name: promptCompanyName,
@@ -2459,9 +3243,9 @@ async function createCompanyAnalysisRecord(stock, inputCompanyName) {
   return record;
 }
 
-async function resolveStockForAnalysis(identifier) {
+async function resolveStockForAnalysis(ownerId, identifier) {
   const rawIdentifier = cleanText(identifier);
-  const watchItem = findWatchItemMaybe(identifier);
+  const watchItem = findWatchItemMaybe(ownerId, identifier);
   if (watchItem) {
     return {
       ts_code: watchItem.ts_code,
@@ -2476,7 +3260,7 @@ async function resolveStockForAnalysis(identifier) {
 
   const tsCode = looksLikeStockCode(identifier) ? normalizeCode(identifier) : "";
   if (!tsCode) {
-    const watchItemByName = db.watchlist.find((entry) => entry.name === rawIdentifier);
+    const watchItemByName = db.watchlist.find((entry) => entry.owner_id === ownerId && entry.name === rawIdentifier);
     if (watchItemByName) {
       return {
         ts_code: watchItemByName.ts_code,
@@ -2503,20 +3287,24 @@ function looksLikeStockCode(value) {
   return /^\d{6}(\.(SH|SZ|BJ))?$/.test(raw);
 }
 
-function companyAnalysisRecords(tsCode) {
+function companyAnalysisJobKey(ownerId, tsCode) {
+  return `${ownerId || "anonymous"}:${normalizeCode(tsCode)}`;
+}
+
+function companyAnalysisRecords(ownerId, tsCode) {
   const normalized = normalizeCode(tsCode);
   return (db.company_analyses || [])
-    .filter((record) => record.ts_code === normalized)
+    .filter((record) => record.owner_id === ownerId && record.ts_code === normalized)
     .slice()
     .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
 }
 
-function latestCompanyAnalysis(tsCode) {
-  return companyAnalysisRecords(tsCode)[0] || null;
+function latestCompanyAnalysis(ownerId, tsCode) {
+  return companyAnalysisRecords(ownerId, tsCode)[0] || null;
 }
 
-function companyAnalysisHistory(tsCode) {
-  return companyAnalysisRecords(tsCode).map((record) => ({
+function companyAnalysisHistory(ownerId, tsCode) {
+  return companyAnalysisRecords(ownerId, tsCode).map((record) => ({
     id: record.id,
     ts_code: record.ts_code,
     stock_name: record.stock_name,
@@ -2527,13 +3315,13 @@ function companyAnalysisHistory(tsCode) {
   }));
 }
 
-function companyAnalysisStatus(tsCode) {
+function companyAnalysisStatus(ownerId, tsCode) {
   const normalized = normalizeCode(tsCode);
-  const job = companyAnalysisJobs.get(normalized);
+  const job = companyAnalysisJobs.get(companyAnalysisJobKey(ownerId, normalized));
   if (job && ["pending", "running", "failed"].includes(job.status)) {
     return { ...job };
   }
-  const latest = latestCompanyAnalysis(normalized);
+  const latest = latestCompanyAnalysis(ownerId, normalized);
   if (latest) {
     return {
       status: "ready",
@@ -2558,11 +3346,13 @@ function companyAnalysisStatus(tsCode) {
 
 function scheduleCompanyAnalysisForWatchItem(item, reason) {
   const tsCode = normalizeCode(item?.ts_code);
-  if (!tsCode || !GEMINI_API_KEY || latestCompanyAnalysis(tsCode)) {
+  const ownerId = item?.owner_id || "";
+  if (!tsCode || !ownerId || !GEMINI_API_KEY || latestCompanyAnalysis(ownerId, tsCode)) {
     return;
   }
 
-  const current = companyAnalysisJobs.get(tsCode);
+  const jobKey = companyAnalysisJobKey(ownerId, tsCode);
+  const current = companyAnalysisJobs.get(jobKey);
   if (current && ["pending", "running"].includes(current.status)) {
     return;
   }
@@ -2579,7 +3369,7 @@ function scheduleCompanyAnalysisForWatchItem(item, reason) {
     updated_at: nowIso(),
     error: "",
   };
-  companyAnalysisJobs.set(tsCode, job);
+  companyAnalysisJobs.set(jobKey, job);
 
   const timer = setTimeout(() => {
     runScheduledCompanyAnalysis(item, job).catch((error) => {
@@ -2591,11 +3381,13 @@ function scheduleCompanyAnalysisForWatchItem(item, reason) {
 
 async function runScheduledCompanyAnalysis(item, job) {
   const tsCode = normalizeCode(item?.ts_code);
-  if (!tsCode) {
+  const ownerId = item?.owner_id || "";
+  if (!tsCode || !ownerId) {
     return;
   }
-  if (latestCompanyAnalysis(tsCode)) {
-    companyAnalysisJobs.delete(tsCode);
+  const jobKey = companyAnalysisJobKey(ownerId, tsCode);
+  if (latestCompanyAnalysis(ownerId, tsCode)) {
+    companyAnalysisJobs.delete(jobKey);
     return;
   }
 
@@ -2603,10 +3395,10 @@ async function runScheduledCompanyAnalysis(item, job) {
   job.label = "自动分析中";
   job.updated_at = nowIso();
   job.error = "";
-  companyAnalysisJobs.set(tsCode, job);
+  companyAnalysisJobs.set(jobKey, job);
 
   try {
-    const record = await createCompanyAnalysisRecord({
+    const record = await createCompanyAnalysisRecord(ownerId, {
       ts_code: item.ts_code,
       symbol: item.symbol,
       name: item.name,
@@ -2615,7 +3407,7 @@ async function runScheduledCompanyAnalysis(item, job) {
       market: item.market,
       list_date: item.list_date,
     }, item.name || item.ts_code);
-    companyAnalysisJobs.set(tsCode, {
+    companyAnalysisJobs.set(jobKey, {
       ...job,
       status: "ready",
       label: "已自动生成",
@@ -2624,7 +3416,7 @@ async function runScheduledCompanyAnalysis(item, job) {
       error: "",
     });
   } catch (error) {
-    companyAnalysisJobs.set(tsCode, {
+    companyAnalysisJobs.set(jobKey, {
       ...job,
       status: "failed",
       label: "自动分析失败",
@@ -2674,14 +3466,14 @@ async function callGeminiJsonWithParts(parts) {
     if (process.platform === "win32") {
       return callGeminiJsonViaPowerShell(safeParts, cause);
     }
-    const error = new Error(`Gemini 网络请求失败：${cause.message}`);
+    const error = new Error(`AI 网络请求失败：${cause.message}`);
     error.status = 502;
     throw error;
   }
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const message = payload?.error?.message || `Gemini HTTP ${response.status}`;
+    const message = payload?.error?.message || `AI HTTP ${response.status}`;
     const error = new Error(message);
     error.status = 502;
     throw error;
@@ -2730,7 +3522,7 @@ $response | ConvertTo-Json -Depth 100 -Compress
     GEMINI_ENDPOINT,
     GEMINI_PARTS_B64: Buffer.from(JSON.stringify(parts), "utf8").toString("base64"),
   }).catch((error) => {
-    const wrapped = new Error(`Gemini 网络请求失败：${fetchError?.message || error.message}；PowerShell 兜底也失败：${error.message}`);
+    const wrapped = new Error(`AI 网络请求失败：${fetchError?.message || error.message}；PowerShell 兜底也失败：${error.message}`);
     wrapped.status = 502;
     throw wrapped;
   });
@@ -2739,7 +3531,7 @@ $response | ConvertTo-Json -Depth 100 -Compress
   try {
     payload = JSON.parse(payloadText);
   } catch {
-    throw badGateway("Gemini PowerShell 兜底返回解析失败");
+    throw badGateway("AI PowerShell 兜底返回解析失败");
   }
   return parseGeminiPayload(payload);
 }
@@ -2752,7 +3544,7 @@ function parseGeminiPayload(payload) {
     .join("\n")
     .trim();
   if (!text) {
-    const error = new Error("Gemini 没有返回可解析内容");
+    const error = new Error("AI 没有返回可解析内容");
     error.status = 502;
     throw error;
   }
@@ -2816,12 +3608,12 @@ function parseJsonObject(text) {
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
   if (start < 0 || end <= start) {
-    throw badGateway("Gemini 返回内容不是 JSON 对象");
+    throw badGateway("AI 返回内容不是 JSON 对象");
   }
   try {
     return JSON.parse(cleaned.slice(start, end + 1));
   } catch {
-    throw badGateway("Gemini 返回 JSON 解析失败");
+    throw badGateway("AI 返回 JSON 解析失败");
   }
 }
 
@@ -3423,7 +4215,9 @@ function quarterKey(tradeDate) {
 
 function enrichWatchItem(item) {
   const price = db.prices[item.ts_code] || null;
-  const group = db.groups.find((entry) => entry.id === item.group_id) || db.groups[0];
+  const group = db.groups.find((entry) => entry.owner_id === item.owner_id && entry.id === item.group_id)
+    || ownerGroups(item.owner_id)[0]
+    || null;
   return {
     ...item,
     group,
@@ -3473,8 +4267,8 @@ function computeValuation(item, price) {
   };
 }
 
-function buildDashboard() {
-  const items = db.watchlist.map(enrichWatchItem);
+function buildDashboard(ownerId) {
+  const items = ownerWatchlist(ownerId).map(enrichWatchItem);
   const priced = items.filter((item) => item.price);
   const stats = {
     total: items.length,
@@ -3504,7 +4298,7 @@ function buildDashboard() {
     .filter((item) => item.valuation.status === "fair" && typeof item.valuation.low_gap_pct === "number")
     .sort((a, b) => Math.abs(a.valuation.low_gap_pct) - Math.abs(b.valuation.low_gap_pct))
     .slice(0, 8);
-  const recentHistory = db.valuation_history.slice(0, 8);
+  const recentHistory = ownerValuationHistory(ownerId).slice(0, 8);
 
   return {
     stats,
@@ -3513,7 +4307,7 @@ function buildDashboard() {
     movers,
     nearLow,
     recentHistory,
-    sync: publicSyncState(),
+    sync: publicSyncState(ownerId),
   };
 }
 
@@ -3885,9 +4679,23 @@ async function getTargetTradeDate() {
   return targetTradeDateCache.promise;
 }
 
-function publicSyncState() {
+function publicSyncState(ownerId = "") {
+  if (!ownerId) {
+    return {
+      ...syncState,
+      retry_ms: SYNC_RETRY_MS,
+    };
+  }
+  const ownerCodes = new Set(ownerWatchlist(ownerId).map((item) => item.ts_code));
+  const targetDate = syncState.target_trade_date;
   return {
     ...syncState,
+    total: ownerCodes.size,
+    success_count: targetDate
+      ? Array.from(ownerCodes).filter((tsCode) => db.prices[tsCode]?.trade_date === targetDate).length
+      : 0,
+    pending: syncState.pending.filter((item) => ownerCodes.has(item.ts_code)),
+    failures: syncState.failures.filter((item) => ownerCodes.has(item.ts_code) || item.ts_code === "__sync__" || item.ts_code === "__retry__"),
     retry_ms: SYNC_RETRY_MS,
   };
 }
@@ -4029,6 +4837,7 @@ async function getSectorFundFlow(options) {
   const period = ["day", "week", "month", "range"].includes(options.period) ? options.period : "day";
   const candidateTradeDates = await getRecentOpenTradeDates(trendDays + 8);
   const sectorMeta = await getSectorMembers(level);
+  const publicSectors = sectorMeta.sectors.map((sector) => withSectorMemberSearch(sectorMeta, sector));
   const flowPackages = await mapWithConcurrency(candidateTradeDates, 4, async (tradeDate) => {
     const rows = await getMoneyflowByDate(tradeDate);
     return aggregateMoneyflowBySector(tradeDate, rows, sectorMeta);
@@ -4043,7 +4852,7 @@ async function getSectorFundFlow(options) {
 
   const rankingDates = selectRankingDates(tradeDates, period, options);
   const rankingSource = flowByDate.filter((item) => rankingDates.includes(item.trade_date));
-  const ranking = buildSectorRanking(rankingSource, sectorMeta.sectors);
+  const ranking = buildSectorRanking(rankingSource, publicSectors);
 
   return {
     level,
@@ -4052,7 +4861,7 @@ async function getSectorFundFlow(options) {
     start_date: rankingDates[0] || "",
     end_date: rankingDates.at(-1) || "",
     trade_dates: tradeDates,
-    sectors: sectorMeta.sectors,
+    sectors: publicSectors.map(sectorPublicFields),
     trend,
     ranking,
   };
@@ -4128,6 +4937,7 @@ async function buildSectorStrengthMatrix(level) {
   }
 
   const rows = sectorMeta.sectors.map((sector) => {
+    const publicSector = withSectorMemberSearch(sectorMeta, sector);
     const dailyRows = dailyBySector.get(sector.name) || [];
     const windows = {};
     for (const days of sectorStrengthWindows) {
@@ -4137,17 +4947,27 @@ async function buildSectorStrengthMatrix(level) {
     for (const segment of sectorStrengthSegments) {
       segments[segment.key] = summarizeSectorStrengthSegment(dailyRows, segment);
     }
+    const mainlineDuration = summarizeSectorMainlineDuration(dailyRows);
     const price = priceConfirmation.get(sector.name) || {
       return_pct: null,
       covered_count: 0,
     };
     return {
-      code: sector.code,
-      name: sector.name,
-      level: sector.level,
+      ...sectorPublicFields(publicSector),
       member_count: sectorMeta.sectorMembers.get(sector.code)?.length || 0,
       windows,
       segments,
+      daily_flows: dailyRows.map((item) => ({
+        trade_date: item.trade_date,
+        net_amount: round(item.net_amount || 0, 2),
+        gross_amount: round(item.gross_amount || 0, 2),
+        inflow_count: Number(item.inflow_count || 0),
+        outflow_count: Number(item.outflow_count || 0),
+        stock_count: Number(item.stock_count || 0),
+        diffusion_pct: item.diffusion_pct,
+        intensity_pct: item.intensity_pct,
+      })),
+      mainline_duration: mainlineDuration,
       price_return_pct: price.return_pct,
       price_covered_count: price.covered_count,
     };
@@ -4180,6 +5000,292 @@ async function buildSectorStrengthMatrix(level) {
     rows,
     errors: errors.sort((a, b) => String(a.trade_date).localeCompare(String(b.trade_date))).slice(0, 12),
     error_count: errors.length,
+  };
+}
+
+async function getSectorEarningsForecast({ level = "L3", days = 30, refresh = false } = {}) {
+  const normalizedLevel = normalizeSectorLevel(level);
+  const normalizedDays = normalizeForecastDays(days);
+  const cacheKey = `${normalizedLevel}:${normalizedDays}`;
+  const cached = earningsForecastCache.get(cacheKey);
+  if (!refresh && cached?.value && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+  if (!refresh && cached?.promise) {
+    return cached.promise;
+  }
+
+  const promise = buildSectorEarningsForecast(normalizedLevel, normalizedDays)
+    .then((value) => {
+      earningsForecastCache.set(cacheKey, {
+        value,
+        expiresAt: Date.now() + (value.error_count ? 10 * 60 * 1000 : 60 * 60 * 1000),
+        promise: null,
+      });
+      return value;
+    })
+    .catch((error) => {
+      earningsForecastCache.delete(cacheKey);
+      throw error;
+    });
+
+  earningsForecastCache.set(cacheKey, {
+    value: cached?.value || null,
+    expiresAt: 0,
+    promise,
+  });
+  return promise;
+}
+
+async function buildSectorEarningsForecast(level, days) {
+  const sectorMeta = await getSectorMembers(level);
+  const endDate = formatDateCompactShanghai();
+  const startDate = shiftCompactDate(endDate, -(days - 1));
+  const annDates = compactDateRange(startDate, endDate);
+  const errors = [];
+
+  const dayResults = await mapWithConcurrency(annDates, 4, async (annDate) => {
+    try {
+      const rows = await callTushare("forecast", {
+        ann_date: annDate,
+      }, [
+        "ts_code",
+        "ann_date",
+        "end_date",
+        "type",
+        "p_change_min",
+        "p_change_max",
+        "net_profit_min",
+        "net_profit_max",
+        "last_parent_net",
+        "first_ann_date",
+        "summary",
+        "change_reason",
+      ].join(","));
+      return rows || [];
+    } catch (error) {
+      errors.push({ ann_date: annDate, message: error.message });
+      return [];
+    }
+  });
+
+  const deduped = dedupeForecastRows(dayResults.flat());
+  const sectorRows = new Map();
+  for (const sector of sectorMeta.sectors) {
+    const publicSector = withSectorMemberSearch(sectorMeta, sector);
+    sectorRows.set(sector.code, {
+      ...sectorPublicFields(publicSector),
+      member_count: sectorMeta.sectorMembers.get(sector.code)?.length || 0,
+      forecast_count: 0,
+      positive_count: 0,
+      preincrease_count: 0,
+      turnaround_count: 0,
+      slight_increase_count: 0,
+      positive_ratio: 0,
+      coverage_ratio: 0,
+      avg_change_mid_pct: null,
+      max_change_stock: null,
+      latest_ann_date: "",
+      stocks: [],
+    });
+  }
+
+  for (const row of deduped) {
+    const sectorCode = sectorMeta.stockToSectorCode.get(row.ts_code);
+    const sector = sectorCode ? sectorRows.get(sectorCode) : null;
+    if (!sector) {
+      continue;
+    }
+    const stockMeta = sectorMeta.stockMeta.get(row.ts_code) || {};
+    const normalized = normalizeForecastRow(row, stockMeta);
+    sector.forecast_count += 1;
+    sector.latest_ann_date = String(normalized.ann_date || "").localeCompare(sector.latest_ann_date || "") > 0
+      ? normalized.ann_date
+      : sector.latest_ann_date;
+    if (normalized.positive) {
+      sector.positive_count += 1;
+    }
+    if (forecastTypeIncludes(normalized.type, ["预增"])) {
+      sector.preincrease_count += 1;
+    }
+    if (forecastTypeIncludes(normalized.type, ["扭亏"])) {
+      sector.turnaround_count += 1;
+    }
+    if (forecastTypeIncludes(normalized.type, ["略增", "续盈", "减亏"])) {
+      sector.slight_increase_count += 1;
+    }
+    sector.stocks.push(normalized);
+  }
+
+  const rows = Array.from(sectorRows.values())
+    .filter((row) => row.forecast_count > 0)
+    .map((row) => finalizeForecastSectorRow(row))
+    .sort((a, b) => {
+      const scoreDiff = Number(b.heat_score || 0) - Number(a.heat_score || 0);
+      if (scoreDiff) return scoreDiff;
+      const positiveDiff = Number(b.positive_count || 0) - Number(a.positive_count || 0);
+      if (positiveDiff) return positiveDiff;
+      return Number(b.avg_change_mid_pct || -Infinity) - Number(a.avg_change_mid_pct || -Infinity);
+    });
+
+  rows.forEach((row, index) => {
+    row.rank = index + 1;
+  });
+
+  const totalForecastCount = rows.reduce((sum, row) => sum + row.forecast_count, 0);
+  const positiveCount = rows.reduce((sum, row) => sum + row.positive_count, 0);
+  const topSector = rows[0] || null;
+
+  return {
+    generated_at: nowIso(),
+    level,
+    days,
+    start_date: startDate,
+    end_date: endDate,
+    ann_dates: annDates,
+    summary: {
+      sector_count: sectorMeta.sectors.length,
+      active_sector_count: rows.length,
+      forecast_count: totalForecastCount,
+      positive_count: positiveCount,
+      positive_ratio: totalForecastCount ? round((positiveCount / totalForecastCount) * 100, 2) : 0,
+      positive_sector_count: rows.filter((row) => row.positive_count > 0).length,
+      top_sector: topSector ? {
+        code: topSector.code,
+        name: topSector.name,
+        display_name: topSector.display_name,
+        names: topSector.names,
+        positive_count: topSector.positive_count,
+        avg_change_mid_pct: topSector.avg_change_mid_pct,
+      } : null,
+    },
+    rows,
+    errors: errors.sort((a, b) => String(a.ann_date).localeCompare(String(b.ann_date))).slice(0, 12),
+    error_count: errors.length,
+  };
+}
+
+function normalizeForecastDays(days) {
+  const number = Number(days);
+  return [7, 15, 30, 60, 90].includes(number) ? number : 30;
+}
+
+function compactDateRange(startDate, endDate) {
+  if (!/^\d{8}$/.test(String(startDate || "")) || !/^\d{8}$/.test(String(endDate || ""))) {
+    return [];
+  }
+  const dates = [];
+  let cursor = startDate;
+  while (cursor <= endDate && dates.length < 120) {
+    dates.push(cursor);
+    cursor = shiftCompactDate(cursor, 1);
+  }
+  return dates;
+}
+
+function dedupeForecastRows(rows) {
+  const map = new Map();
+  for (const row of rows || []) {
+    if (!row?.ts_code) {
+      continue;
+    }
+    const key = `${row.ts_code}:${row.end_date || ""}`;
+    const previous = map.get(key);
+    if (!previous || String(row.ann_date || "").localeCompare(String(previous.ann_date || "")) >= 0) {
+      map.set(key, row);
+    }
+  }
+  return Array.from(map.values());
+}
+
+function normalizeForecastRow(row, stockMeta = {}) {
+  const changeMid = forecastChangeMid(row);
+  const type = cleanText(row.type);
+  const positive = isPositiveForecast(row);
+  return {
+    ts_code: row.ts_code,
+    name: stockMeta.name || row.name || row.ts_code,
+    ann_date: String(row.ann_date || ""),
+    end_date: String(row.end_date || ""),
+    first_ann_date: String(row.first_ann_date || ""),
+    type,
+    positive,
+    p_change_min: nullableNumber(row.p_change_min),
+    p_change_max: nullableNumber(row.p_change_max),
+    change_mid_pct: changeMid,
+    net_profit_min: nullableNumber(row.net_profit_min),
+    net_profit_max: nullableNumber(row.net_profit_max),
+    last_parent_net: nullableNumber(row.last_parent_net),
+    summary: cleanText(row.summary),
+    change_reason: cleanText(row.change_reason),
+  };
+}
+
+function forecastChangeMid(row) {
+  const min = nullableNumber(row.p_change_min);
+  const max = nullableNumber(row.p_change_max);
+  if (Number.isFinite(min) && Number.isFinite(max)) {
+    return round((min + max) / 2, 2);
+  }
+  if (Number.isFinite(min)) {
+    return min;
+  }
+  if (Number.isFinite(max)) {
+    return max;
+  }
+  return null;
+}
+
+function isPositiveForecast(row) {
+  const type = cleanText(row.type);
+  if (forecastTypeIncludes(type, ["预增", "略增", "扭亏", "续盈", "减亏"])) {
+    return true;
+  }
+  const mid = forecastChangeMid(row);
+  return Number.isFinite(mid) && mid > 0;
+}
+
+function forecastTypeIncludes(type, values) {
+  const text = cleanText(type);
+  return values.some((value) => text.includes(value));
+}
+
+function finalizeForecastSectorRow(row) {
+  const positives = row.stocks.filter((stock) => stock.positive);
+  const changes = positives
+    .map((stock) => stock.change_mid_pct)
+    .filter((value) => Number.isFinite(Number(value)));
+  const avgChange = changes.length
+    ? round(changes.reduce((sum, value) => sum + Number(value), 0) / changes.length, 2)
+    : null;
+  const sortedStocks = row.stocks
+    .slice()
+    .sort((a, b) => {
+      if (a.positive !== b.positive) {
+        return a.positive ? -1 : 1;
+      }
+      return Number(b.change_mid_pct || -Infinity) - Number(a.change_mid_pct || -Infinity);
+    });
+  const maxChangeStock = sortedStocks
+    .filter((stock) => Number.isFinite(Number(stock.change_mid_pct)))
+    .sort((a, b) => Number(b.change_mid_pct) - Number(a.change_mid_pct))[0] || null;
+  const positiveRatio = row.forecast_count ? round((row.positive_count / row.forecast_count) * 100, 2) : 0;
+  const coverageRatio = row.member_count ? round((row.forecast_count / row.member_count) * 100, 2) : 0;
+  return {
+    ...row,
+    positive_ratio: positiveRatio,
+    coverage_ratio: coverageRatio,
+    avg_change_mid_pct: avgChange,
+    max_change_stock: maxChangeStock,
+    representative_stocks: sortedStocks.slice(0, 8),
+    heat_score: round(
+      row.positive_count * 10
+      + positiveRatio * 0.35
+      + Math.min(Math.max(Number(avgChange || 0), 0), 300) * 0.12
+      + Math.min(coverageRatio, 100) * 0.2,
+      2,
+    ),
+    stocks: sortedStocks,
   };
 }
 
@@ -4306,6 +5412,63 @@ function maxPositiveNetStreak(rows) {
     }
   }
   return best;
+}
+
+function summarizeSectorMainlineDuration(dailyRows) {
+  const rows = (dailyRows || [])
+    .filter((row) => row && row.trade_date)
+    .sort((a, b) => String(a.trade_date).localeCompare(String(b.trade_date)));
+  const activeByIndex = rows.map((_, index) => isSectorMainlineAtIndex(rows, index));
+  const runs = [];
+  let runStart = -1;
+  for (let index = 0; index < activeByIndex.length; index += 1) {
+    if (activeByIndex[index] && runStart < 0) {
+      runStart = index;
+    }
+    if ((!activeByIndex[index] || index === activeByIndex.length - 1) && runStart >= 0) {
+      const endIndex = activeByIndex[index] ? index : index - 1;
+      runs.push({
+        days: endIndex - runStart + 1,
+        start_date: rows[runStart]?.trade_date || "",
+        end_date: rows[endIndex]?.trade_date || "",
+      });
+      runStart = -1;
+    }
+  }
+  const latestActive = Boolean(activeByIndex.at(-1));
+  const latestRun = latestActive ? runs.at(-1) : null;
+  const lastRun = runs.at(-1) || null;
+  const maxRun = runs.reduce((best, run) => Number(run.days || 0) > Number(best.days || 0) ? run : best, { days: 0, start_date: "", end_date: "" });
+  return {
+    active: latestActive,
+    current_days: latestRun?.days || 0,
+    current_start_date: latestRun?.start_date || "",
+    current_end_date: latestRun?.end_date || "",
+    last_days: lastRun?.days || 0,
+    last_start_date: lastRun?.start_date || "",
+    last_end_date: lastRun?.end_date || "",
+    max_days: maxRun.days || 0,
+    max_start_date: maxRun.start_date || "",
+    max_end_date: maxRun.end_date || "",
+    rule: "3/5/7/15/30/60/90日资金窗口均为正",
+  };
+}
+
+function isSectorMainlineAtIndex(rows, index) {
+  const windows = [3, 5, 7, 15, 30, 60, 90];
+  return windows.every((days) => trailingNetAmountAtIndex(rows, index, days) > 0);
+}
+
+function trailingNetAmountAtIndex(rows, index, days) {
+  const start = index - days + 1;
+  if (start < 0) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  let sum = 0;
+  for (let cursor = start; cursor <= index; cursor += 1) {
+    sum += Number(rows[cursor]?.net_amount || 0);
+  }
+  return sum;
 }
 
 async function buildSectorPriceConfirmation(sectorMeta, tradeDates) {
@@ -4557,6 +5720,9 @@ function buildSectorStrengthSummary(rows) {
   for (const row of rows) {
     statusCounts[row.status] = (statusCounts[row.status] || 0) + 1;
   }
+  const longestMainline = rows
+    .filter((row) => Number(row.mainline_duration?.current_days || 0) > 0)
+    .sort((a, b) => Number(b.mainline_duration?.current_days || 0) - Number(a.mainline_duration?.current_days || 0))[0] || null;
   return {
     total: rows.length,
     top: rows[0] ? {
@@ -4566,6 +5732,14 @@ function buildSectorStrengthSummary(rows) {
       status: rows[0].status,
     } : null,
     status_counts: statusCounts,
+    longest_mainline: longestMainline ? {
+      code: longestMainline.code,
+      name: longestMainline.name,
+      current_days: longestMainline.mainline_duration?.current_days || 0,
+      current_start_date: longestMainline.mainline_duration?.current_start_date || "",
+      current_end_date: longestMainline.mainline_duration?.current_end_date || "",
+      rule: longestMainline.mainline_duration?.rule || "",
+    } : null,
     mainline_count: statusCounts["主线增强"] || 0,
     new_start_count: statusCounts["新启动"] || 0,
     warning_count: statusCounts["退潮预警"] || 0,
@@ -4817,6 +5991,13 @@ async function getSectorMembers(level = "L3") {
       for (const list of meta.sectorMembers.values()) {
         list.sort((a, b) => a.ts_code.localeCompare(b.ts_code));
       }
+    }
+
+    await syncSectorMetadata(levels);
+    for (const meta of Object.values(levels)) {
+      const enrichedSectors = meta.sectors.map(enrichSectorWithMeta);
+      meta.sectors = enrichedSectors;
+      meta.sectorByCode = new Map(enrichedSectors.map((sector) => [sector.code, sector]));
     }
 
     sectorCache.value = levels;
@@ -5421,8 +6602,7 @@ function buildSectorRanking(flowByDate, sectors) {
   const ranking = new Map();
   for (const sector of sectors) {
     ranking.set(sector.name, {
-      code: sector.code,
-      name: sector.name,
+      ...sectorPublicFields(sector),
       net_amount: 0,
       gross_amount: 0,
       inflow_count: 0,
