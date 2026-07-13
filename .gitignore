@@ -14,4 +14,6 @@ tools/*.exe
 data/*.log
 data/*.tmp
 data/*.txt
+data/*.db
+data/*.db-*
 data/store.json

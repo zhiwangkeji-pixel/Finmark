@@ -167,12 +167,14 @@ sudo systemctl restart valuation-diary
 
 ```text
 /opt/valuation-diary/data/store.json
+/opt/valuation-diary/data/finmark-cache.db
 ```
 
 建议定时备份：
 
 ```bash
 sudo cp /opt/valuation-diary/data/store.json /opt/valuation-diary/data/store-$(date +%F-%H%M).json
+sudo cp /opt/valuation-diary/data/finmark-cache.db /opt/valuation-diary/data/finmark-cache-$(date +%F-%H%M).db
 ```
 
-公网部署后，务必在系统里把默认管理员密码改掉，并定期备份 `data/store.json`。
+公网部署后，务必在系统里把默认管理员密码改掉，并定期备份 `data/store.json` 和 `data/finmark-cache.db`。

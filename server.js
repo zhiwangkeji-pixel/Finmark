@@ -4,11 +4,18 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } = require("node:crypto");
 const { URL } = require("node:url");
+let DatabaseSync = null;
+try {
+  ({ DatabaseSync } = require("node:sqlite"));
+} catch {
+  DatabaseSync = null;
+}
 
 const rootDir = __dirname;
 const publicDir = path.join(rootDir, "public");
 const dataDir = path.join(rootDir, "data");
 const dataFile = path.join(dataDir, "store.json");
+const cacheDbFile = path.join(dataDir, "finmark-cache.db");
 
 loadEnv(path.join(rootDir, ".env"));
 
@@ -117,7 +124,9 @@ const turnoverMonitorCache = {
 
 let db = loadStore();
 let writeQueue = Promise.resolve();
+let cacheDb = null;
 ensureDefaultAdminUser();
+migrateJsonCacheToSqlite();
 let retryTimer = null;
 let syncState = {
   active: false,
@@ -1668,15 +1677,130 @@ function persistStore() {
   return writeQueue;
 }
 
+function getCacheDb() {
+  if (!DatabaseSync) {
+    throw new Error("当前 Node.js 版本不支持内置 SQLite，请升级到 Node 22+。");
+  }
+  if (cacheDb) {
+    return cacheDb;
+  }
+  fs.mkdirSync(dataDir, { recursive: true });
+  cacheDb = new DatabaseSync(cacheDbFile);
+  cacheDb.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    CREATE TABLE IF NOT EXISTS trade_calendar (
+      exchange TEXT NOT NULL,
+      cal_date TEXT NOT NULL,
+      is_open INTEGER NOT NULL DEFAULT 0,
+      pretrade_date TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (exchange, cal_date)
+    );
+    CREATE TABLE IF NOT EXISTS tushare_rows_cache (
+      namespace TEXT NOT NULL,
+      cache_key TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      row_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (namespace, cache_key)
+    );
+    CREATE TABLE IF NOT EXISTS sector_strength_snapshots (
+      level TEXT PRIMARY KEY,
+      payload TEXT NOT NULL,
+      generated_at TEXT NOT NULL DEFAULT '',
+      cached_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_tushare_rows_cache_updated
+      ON tushare_rows_cache(namespace, updated_at);
+  `);
+  return cacheDb;
+}
+
+function readJsonPayload(value, fallback = null) {
+  try {
+    return value ? JSON.parse(value) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function getRowsCache(namespace, cacheKey) {
+  const row = getCacheDb()
+    .prepare("SELECT payload FROM tushare_rows_cache WHERE namespace = ? AND cache_key = ?")
+    .get(namespace, cacheKey);
+  const rows = readJsonPayload(row?.payload, null);
+  return Array.isArray(rows) ? rows : null;
+}
+
+function setRowsCache(namespace, cacheKey, rows) {
+  if (!Array.isArray(rows) || !rows.length) {
+    return;
+  }
+  const now = nowIso();
+  getCacheDb()
+    .prepare(`
+      INSERT INTO tushare_rows_cache (namespace, cache_key, payload, row_count, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(namespace, cache_key) DO UPDATE SET
+        payload = excluded.payload,
+        row_count = excluded.row_count,
+        updated_at = excluded.updated_at
+    `)
+    .run(namespace, cacheKey, JSON.stringify(rows), rows.length, now, now);
+}
+
+function normalizeCacheRows(rows, normalizer) {
+  const source = Array.isArray(rows) ? rows : [];
+  return typeof normalizer === "function" ? source.map(normalizer).filter(Boolean) : source;
+}
+
+function migrateJsonCacheToSqlite() {
+  if (!DatabaseSync) {
+    return;
+  }
+  try {
+    const calendar = db.tushare_cache?.trade_cal || {};
+    const calendarStmt = getCacheDb()
+      .prepare(`
+        INSERT INTO trade_calendar (exchange, cal_date, is_open, pretrade_date, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(exchange, cal_date) DO NOTHING
+      `);
+    for (const [exchange, bucket] of Object.entries(calendar)) {
+      const rows = bucket?.rows && typeof bucket.rows === "object" ? bucket.rows : {};
+      for (const row of Object.values(rows)) {
+        const normalized = normalizeTradeCalendarRow(row);
+        if (normalized) {
+          calendarStmt.run(exchange || normalized.exchange || "SSE", normalized.cal_date, Number(normalized.is_open || 0), normalized.pretrade_date || "", bucket.updated_at || nowIso());
+        }
+      }
+    }
+
+    const snapshots = db.sector_strength_snapshots && typeof db.sector_strength_snapshots === "object"
+      ? db.sector_strength_snapshots
+      : {};
+    const snapshotStmt = getCacheDb()
+      .prepare(`
+        INSERT INTO sector_strength_snapshots (level, payload, generated_at, cached_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(level) DO NOTHING
+      `);
+    for (const [level, snapshot] of Object.entries(snapshots)) {
+      if (snapshot && Array.isArray(snapshot.rows) && snapshot.rows.length) {
+        snapshotStmt.run(level, JSON.stringify(snapshot), snapshot.generated_at || "", snapshot.cached_at || snapshot.generated_at || nowIso());
+      }
+    }
+  } catch (error) {
+    console.warn(`SQLite 缓存迁移失败：${error.message}`);
+  }
+}
+
 function tradeCalendarBucket(exchange = "SSE") {
-  db.tushare_cache = normalizeTushareCache(db.tushare_cache);
-  db.tushare_cache.trade_cal[exchange] = db.tushare_cache.trade_cal[exchange] || {
-    rows: {},
-    updated_at: "",
+  return {
+    exchange: String(exchange || "SSE"),
   };
-  const bucket = db.tushare_cache.trade_cal[exchange];
-  bucket.rows = bucket.rows && typeof bucket.rows === "object" ? bucket.rows : {};
-  return bucket;
 }
 
 function compactDateList(startDate, endDate) {
@@ -1695,14 +1819,22 @@ function compactDateList(startDate, endDate) {
 }
 
 function tradeCalendarRowsFromStore(exchange, startDate, endDate) {
-  const bucket = tradeCalendarBucket(exchange);
   const dates = compactDateList(startDate, endDate);
-  const rows = dates
-    .map((date) => bucket.rows[date])
+  if (!dates.length) {
+    return { rows: [], complete: false };
+  }
+  const placeholders = dates.map(() => "?").join(",");
+  const rows = getCacheDb()
+    .prepare(`
+      SELECT exchange, cal_date, is_open, pretrade_date
+      FROM trade_calendar
+      WHERE exchange = ? AND cal_date IN (${placeholders})
+      ORDER BY cal_date ASC
+    `)
+    .all(exchange, ...dates)
     .filter(Boolean)
     .map(normalizeTradeCalendarRow)
-    .filter(Boolean)
-    .sort((a, b) => String(a.cal_date).localeCompare(String(b.cal_date)));
+    .filter(Boolean);
   return {
     rows,
     complete: dates.length > 0 && rows.length === dates.length,
@@ -1779,12 +1911,19 @@ async function getTradeCalendarRows(exchange = "SSE", startDate, endDate) {
         start_date: start,
         end_date: end,
       }, "exchange,cal_date,is_open,pretrade_date");
-      const bucket = tradeCalendarBucket(normalizedExchange);
+      const stmt = getCacheDb()
+        .prepare(`
+          INSERT INTO trade_calendar (exchange, cal_date, is_open, pretrade_date, updated_at)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(exchange, cal_date) DO UPDATE SET
+            is_open = excluded.is_open,
+            pretrade_date = excluded.pretrade_date,
+            updated_at = excluded.updated_at
+        `);
+      const updatedAt = nowIso();
       for (const row of rows.map(normalizeTradeCalendarRow).filter(Boolean)) {
-        bucket.rows[row.cal_date] = row;
+        stmt.run(row.exchange || normalizedExchange, row.cal_date, Number(row.is_open || 0), row.pretrade_date || "", updatedAt);
       }
-      bucket.updated_at = nowIso();
-      await persistStore();
       return tradeCalendarRowsFromStore(normalizedExchange, start, end).rows;
     } catch (error) {
       const fallbackRows = buildFallbackTradeCalendarRows(normalizedExchange, start, end);
@@ -1803,10 +1942,10 @@ async function getTradeCalendarRows(exchange = "SSE", startDate, endDate) {
 }
 
 function getSectorStrengthSnapshot(level, options = {}) {
-  const snapshots = db.sector_strength_snapshots && typeof db.sector_strength_snapshots === "object"
-    ? db.sector_strength_snapshots
-    : {};
-  const snapshot = snapshots[level];
+  const record = getCacheDb()
+    .prepare("SELECT payload FROM sector_strength_snapshots WHERE level = ?")
+    .get(level);
+  const snapshot = readJsonPayload(record?.payload, null);
   if (!snapshot || !Array.isArray(snapshot.rows) || !snapshot.rows.length) {
     return null;
   }
@@ -1829,14 +1968,20 @@ async function persistSectorStrengthSnapshot(level, value) {
   if (!value || !Array.isArray(value.rows) || !value.rows.length) {
     return;
   }
-  db.sector_strength_snapshots = db.sector_strength_snapshots && typeof db.sector_strength_snapshots === "object"
-    ? db.sector_strength_snapshots
-    : {};
-  db.sector_strength_snapshots[level] = {
+  const snapshot = {
     ...value,
     cached_at: nowIso(),
   };
-  await persistStore();
+  getCacheDb()
+    .prepare(`
+      INSERT INTO sector_strength_snapshots (level, payload, generated_at, cached_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(level) DO UPDATE SET
+        payload = excluded.payload,
+        generated_at = excluded.generated_at,
+        cached_at = excluded.cached_at
+    `)
+    .run(level, JSON.stringify(snapshot), snapshot.generated_at || "", snapshot.cached_at);
 }
 
 async function createGroup(ownerId, name) {
@@ -6272,6 +6417,15 @@ async function getMoneyflowByDate(tradeDate) {
   if (cached && cached.expiresAt > Date.now()) {
     return cached.rows;
   }
+  const cacheKey = String(tradeDate || "");
+  const storedRows = getRowsCache("moneyflow_by_date", cacheKey);
+  if (storedRows) {
+    moneyflowCache.set(tradeDate, {
+      expiresAt: Date.now() + 6 * 60 * 60 * 1000,
+      rows: storedRows,
+    });
+    return storedRows;
+  }
 
   const rows = await callTushare("moneyflow", {
     trade_date: tradeDate,
@@ -6286,6 +6440,7 @@ async function getMoneyflowByDate(tradeDate) {
     "sell_elg_amount",
   ].join(","));
 
+  setRowsCache("moneyflow_by_date", cacheKey, rows);
   moneyflowCache.set(tradeDate, {
     expiresAt: Date.now() + 6 * 60 * 60 * 1000,
     rows,
@@ -6298,12 +6453,23 @@ async function getDailyByDate(tradeDate) {
   if (cached && cached.expiresAt > Date.now()) {
     return cached.rows;
   }
+  const cacheKey = String(tradeDate || "");
+  const storedRows = getRowsCache("daily_by_date", cacheKey);
+  if (storedRows) {
+    const normalizedStored = normalizeCacheRows(storedRows, normalizeDailyRow);
+    dailyByDateCache.set(tradeDate, {
+      expiresAt: Date.now() + 6 * 60 * 60 * 1000,
+      rows: normalizedStored,
+    });
+    return normalizedStored;
+  }
 
   const rows = await callTushare("daily", {
     trade_date: tradeDate,
   }, "ts_code,trade_date,open,high,low,close,pct_chg,vol,amount");
 
   const normalized = rows.map(normalizeDailyRow);
+  setRowsCache("daily_by_date", cacheKey, normalized);
   dailyByDateCache.set(tradeDate, {
     expiresAt: Date.now() + 6 * 60 * 60 * 1000,
     rows: normalized,
@@ -6316,12 +6482,23 @@ async function getDailyBasicByDate(tradeDate) {
   if (cached && cached.expiresAt > Date.now()) {
     return cached.rows;
   }
+  const cacheKey = String(tradeDate || "");
+  const storedRows = getRowsCache("daily_basic_by_date", cacheKey);
+  if (storedRows) {
+    const normalizedStored = normalizeCacheRows(storedRows, normalizeTurnoverDailyBasicRow);
+    dailyBasicByDateCache.set(tradeDate, {
+      expiresAt: Date.now() + 6 * 60 * 60 * 1000,
+      rows: normalizedStored,
+    });
+    return normalizedStored;
+  }
 
   const rows = await callTushare("daily_basic", {
     trade_date: tradeDate,
   }, "ts_code,trade_date,close,turnover_rate,total_mv,circ_mv");
 
   const normalized = rows.map(normalizeTurnoverDailyBasicRow);
+  setRowsCache("daily_basic_by_date", cacheKey, normalized);
   dailyBasicByDateCache.set(tradeDate, {
     expiresAt: Date.now() + 6 * 60 * 60 * 1000,
     rows: normalized,
