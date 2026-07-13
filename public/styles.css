@@ -6492,7 +6492,8 @@ textarea:focus-visible,
   color: var(--green) !important;
 }
 
-body[data-page="earnings-forecast"] .app {
+body[data-page="earnings-forecast"] .app,
+body[data-page="earnings-forecast-detail"] .app {
   width: min(100% - 20px, 1920px);
 }
 
@@ -6519,14 +6520,14 @@ body[data-page="earnings-forecast"] .app {
 }
 
 .earnings-forecast-table {
-  min-width: 1320px;
+  min-width: 1440px;
   background: #151515;
 }
 
 .earnings-forecast-head,
 .earnings-forecast-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1.15fr) 0.58fr 0.72fr 0.72fr minmax(190px, 0.95fr) minmax(360px, 1.8fr);
+  grid-template-columns: minmax(220px, 1.1fr) 0.5fr 0.68fr 0.68fr minmax(180px, 0.85fr) minmax(320px, 1.55fr) 96px;
   gap: 12px;
   align-items: center;
   padding: 12px 16px;
@@ -6609,6 +6610,84 @@ body[data-page="earnings-forecast"] .app {
 .forecast-stock-chip small {
   color: #a1a1aa;
   font-size: 11px;
+}
+
+.forecast-row-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.earnings-detail-head .page-subtitle {
+  max-width: 760px;
+}
+
+.earnings-detail-stats {
+  grid-template-columns: repeat(4, minmax(180px, 1fr));
+}
+
+.earnings-detail-panel {
+  overflow: hidden;
+}
+
+.earnings-detail-table {
+  min-width: 1680px;
+  background: #151515;
+}
+
+.earnings-detail-table-head,
+.earnings-detail-table-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.95fr) 0.62fr 0.58fr 0.72fr 0.82fr 0.95fr 0.76fr minmax(320px, 1.45fr) 96px;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid #282828;
+}
+
+.earnings-detail-table-head {
+  min-height: 42px;
+  color: #b8b8c2;
+  background: #121212;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.earnings-detail-table-row {
+  min-height: 86px;
+}
+
+.earnings-detail-table-row:hover {
+  background: #1c1c1c;
+}
+
+.earnings-detail-table-row > div {
+  min-width: 0;
+}
+
+.earnings-detail-table-row strong {
+  display: block;
+  color: #f5f5f5;
+}
+
+.earnings-detail-table-row span {
+  display: block;
+  color: #a1a1aa;
+  font-size: 12px;
+}
+
+.earnings-detail-table-row.positive .stock-cell strong {
+  color: #fde68a;
+}
+
+.forecast-reason {
+  display: -webkit-box;
+  overflow: hidden;
+  color: #d4d4d8;
+  font-size: 12px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .decision-day.profit,

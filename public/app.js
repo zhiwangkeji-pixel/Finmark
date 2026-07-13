@@ -126,6 +126,7 @@ const state = {
   earningsForecastLevel: "L3",
   earningsForecastDays: 30,
   earningsForecastQuery: "",
+  earningsForecastDetailQuery: "",
   sectorFlow: null,
   sectorLoading: false,
   sectorError: "",
@@ -1175,6 +1176,11 @@ function render() {
 
   if (state.route.page === "earnings-forecast") {
     renderEarningsForecast();
+    return;
+  }
+
+  if (state.route.page === "earnings-forecast-detail") {
+    renderEarningsForecastDetail();
     return;
   }
 
@@ -5885,6 +5891,7 @@ function renderEarningsForecastTable(rows) {
         <span>平均增幅</span>
         <span>最大预增</span>
         <span>代表股票</span>
+        <span>操作</span>
       </div>
       ${rows.map((row) => renderEarningsForecastRow(row)).join("")}
     </div>
@@ -5927,8 +5934,214 @@ function renderEarningsForecastRow(row) {
         ` : "--"}
       </div>
       <div class="forecast-stock-list">${stockChips || "--"}</div>
+      <div class="forecast-row-actions">
+        <a class="button tiny soft" href="#/earnings-forecast/${escapeAttr(row.level || state.earningsForecastLevel)}/${encodeURIComponent(row.code || "")}?days=${encodeURIComponent(state.earningsForecastDays)}">查看详情</a>
+      </div>
     </div>
   `;
+}
+
+function syncEarningsForecastRouteState() {
+  const route = state.route || {};
+  const routeLevel = String(route.level || state.earningsForecastLevel || "L3").toUpperCase();
+  const routeDays = Number(route.days || state.earningsForecastDays || 30);
+  const normalizedDays = [7, 15, 30, 60, 90].includes(routeDays) ? routeDays : 30;
+  let changed = false;
+
+  if (["L1", "L2", "L3"].includes(routeLevel) && state.earningsForecastLevel !== routeLevel) {
+    state.earningsForecastLevel = routeLevel;
+    changed = true;
+  }
+  if (state.earningsForecastDays !== normalizedDays) {
+    state.earningsForecastDays = normalizedDays;
+    changed = true;
+  }
+  if (changed) {
+    state.earningsForecast = null;
+    state.earningsForecastError = "";
+    state.earningsForecastLoading = false;
+  }
+}
+
+function findEarningsForecastSector() {
+  const route = state.route || {};
+  const routeLevel = String(route.level || state.earningsForecastLevel || "L3").toUpperCase();
+  const routeCode = String(route.id || "");
+  return (state.earningsForecast?.rows || []).find((row) => {
+    return String(row.code || "") === routeCode
+      && String(row.level || state.earningsForecastLevel || "L3").toUpperCase() === routeLevel;
+  }) || null;
+}
+
+function renderEarningsForecastDetail() {
+  syncEarningsForecastRouteState();
+  ensureEarningsForecast();
+  const sector = findEarningsForecastSector();
+  const title = sector ? sectorDisplayName(sector) : "财报预增明细";
+  const detailBody = state.earningsForecastLoading
+    ? `<section class="loading">正在读取板块财报预增公司明细...</section>`
+    : renderEarningsForecastDetailContent(sector);
+
+  app.innerHTML = `
+    ${renderToast()}
+    <section class="page-head earnings-detail-head">
+      <div>
+        <p class="eyebrow">Earnings Forecast Detail</p>
+        <h1 class="page-title">${escapeHtml(title)} 财报预增明细</h1>
+        <p class="page-subtitle">查看该板块最近公告中的业绩预告公司、预告类型、增幅区间、净利润区间和公告原因。</p>
+      </div>
+      <div class="head-actions">
+        <a class="button soft" href="#/earnings-forecast">返回财报预增</a>
+        <button class="button primary" data-action="refresh-earnings-forecast">刷新预增</button>
+      </div>
+    </section>
+    ${detailBody}
+  `;
+}
+
+function renderEarningsForecastDetailContent(sector) {
+  if (state.earningsForecastError) {
+    return `<section class="notice warning">${escapeHtml(state.earningsForecastError)}</section>`;
+  }
+  if (!state.earningsForecast) {
+    return `<section class="empty-inline">正在准备财报预增数据...</section>`;
+  }
+  if (!sector) {
+    return `
+      <section class="panel">
+        <div class="empty-inline">没有找到这个板块的财报预增明细，可能是当前公告范围内没有对应数据。</div>
+      </section>
+    `;
+  }
+
+  const data = state.earningsForecast || {};
+  const query = normalizeQuery(state.earningsForecastDetailQuery);
+  const allStocks = (sector.stocks || []).slice().sort((a, b) => {
+    if (Boolean(a.positive) !== Boolean(b.positive)) {
+      return a.positive ? -1 : 1;
+    }
+    return Number(b.change_mid_pct || -Infinity) - Number(a.change_mid_pct || -Infinity);
+  });
+  const stocks = allStocks.filter((stock) => {
+    if (!query) {
+      return true;
+    }
+    return normalizeQuery([
+      stock.name,
+      stock.ts_code,
+      stock.type,
+      stock.summary,
+      stock.change_reason,
+    ].filter(Boolean).join(" ")).includes(query);
+  });
+
+  return `
+    <section class="stat-grid earnings-detail-stats">
+      ${renderStat("公告公司", sector.forecast_count || 0, "只", `${formatDate(data.start_date)} - ${formatDate(data.end_date)}`)}
+      ${renderStat("正向预告", sector.positive_count || 0, "只", `占比 ${formatPlainPercent(sector.positive_ratio || 0)}`)}
+      ${renderStat("平均增幅", formatPercent(sector.avg_change_mid_pct), "", "按正向样本中值计算")}
+      ${renderStat("最大预增", sector.max_change_stock ? (sector.max_change_stock.name || sector.max_change_stock.ts_code) : "--", "", sector.max_change_stock ? formatForecastChangeRange(sector.max_change_stock) : "暂无")}
+    </section>
+
+    <section class="panel table-panel earnings-detail-panel">
+      <div class="panel-head">
+        <h2>${escapeHtml(sectorDisplayName(sector))} 公司预告明细</h2>
+        <span>${stocks.length} / ${allStocks.length} 只 · ${sectorLevelLabel(sector.level)}</span>
+      </div>
+      <div class="earnings-forecast-note">
+        <strong>数据口径</strong>
+        <span>同一股票同一报告期保留最新公告；净利润字段按 TuShare forecast 接口口径展示为万元。正向预告包括预增、略增、扭亏、续盈、减亏。</span>
+      </div>
+      ${renderListSearch("earningsForecastDetail", state.earningsForecastDetailQuery, "输入股票名称、代码、预告类型或变动原因")}
+      ${renderEarningsForecastStockTable(stocks)}
+    </section>
+  `;
+}
+
+function renderEarningsForecastStockTable(stocks) {
+  if (!stocks.length) {
+    return `<div class="empty-inline">没有匹配的预增公司</div>`;
+  }
+  return `
+    <div class="earnings-detail-table">
+      <div class="earnings-detail-table-head">
+        <span>公司</span>
+        <span>预告类型</span>
+        <span>报告期</span>
+        <span>公告日期</span>
+        <span>增幅区间</span>
+        <span>净利润区间</span>
+        <span>上年同期</span>
+        <span>摘要与原因</span>
+        <span>操作</span>
+      </div>
+      ${stocks.map((stock) => renderEarningsForecastStockRow(stock)).join("")}
+    </div>
+  `;
+}
+
+function renderEarningsForecastStockRow(stock) {
+  const reason = [stock.summary, stock.change_reason].filter(Boolean).join(" / ");
+  return `
+    <div class="earnings-detail-table-row ${stock.positive ? "positive" : ""}">
+      <div class="stock-cell">
+        <strong>${escapeHtml(stock.name || stock.ts_code)}</strong>
+        <span>${escapeHtml(stock.ts_code || "--")}</span>
+      </div>
+      <div>
+        <strong>${escapeHtml(stock.type || "--")}</strong>
+        <span>${stock.positive ? "正向预告" : "非正向预告"}</span>
+      </div>
+      <div>${formatDate(stock.end_date)}</div>
+      <div>
+        <strong>${formatDate(stock.ann_date)}</strong>
+        <span>首次 ${formatDate(stock.first_ann_date)}</span>
+      </div>
+      <div class="${toneClass(stock.change_mid_pct)}">
+        <strong>${formatForecastChangeRange(stock)}</strong>
+        <span>中值 ${formatPercent(stock.change_mid_pct)}</span>
+      </div>
+      <div>
+        <strong>${formatForecastMoneyRange(stock)}</strong>
+        <span>接口金额</span>
+      </div>
+      <div>
+        <strong>${formatForecastMoney(stock.last_parent_net)}</strong>
+        <span>接口金额</span>
+      </div>
+      <div class="forecast-reason" title="${escapeAttr(reason)}">${escapeHtml(reason || "--")}</div>
+      <div class="forecast-row-actions">
+        <a class="button tiny soft" href="#/stock/${encodeURIComponent(stock.ts_code || "")}">个股详情</a>
+      </div>
+    </div>
+  `;
+}
+
+function formatForecastMoneyRange(stock) {
+  const min = stock?.net_profit_min === null || stock?.net_profit_min === undefined ? NaN : Number(stock.net_profit_min);
+  const max = stock?.net_profit_max === null || stock?.net_profit_max === undefined ? NaN : Number(stock.net_profit_max);
+  if (Number.isFinite(min) && Number.isFinite(max) && min !== max) {
+    return `${formatForecastMoney(min)} ~ ${formatForecastMoney(max)}`;
+  }
+  if (Number.isFinite(min)) {
+    return formatForecastMoney(min);
+  }
+  if (Number.isFinite(max)) {
+    return formatForecastMoney(max);
+  }
+  return "--";
+}
+
+function formatForecastMoney(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return "--";
+  }
+  const number = Number(value);
+  const abs = Math.abs(number);
+  if (abs >= 10000) {
+    return `${formatNumber(number / 10000, 2)}亿`;
+  }
+  return `${formatNumber(number, 0)}万`;
 }
 
 function formatForecastChangeRange(stock) {
@@ -10015,6 +10228,9 @@ function handleInput(event) {
     if (listSearch === "earningsForecast") {
       state.earningsForecastQuery = event.target.value;
     }
+    if (listSearch === "earningsForecastDetail") {
+      state.earningsForecastDetailQuery = event.target.value;
+    }
     if (listSearch === "sector") {
       state.sectorQuery = event.target.value;
     }
@@ -10180,6 +10396,9 @@ function applyListSearchValue(kind, value) {
   if (kind === "earningsForecast") {
     state.earningsForecastQuery = value;
   }
+  if (kind === "earningsForecastDetail") {
+    state.earningsForecastDetailQuery = value;
+  }
 }
 
 function applyGlobalSearch(value) {
@@ -10194,6 +10413,7 @@ function applyGlobalSearch(value) {
     "short-strategy": "strategy",
     strength: "strength",
     "earnings-forecast": "earningsForecast",
+    "earnings-forecast-detail": "earningsForecastDetail",
     sectors: "sector",
     "sector-pool": "sectorPool",
     sector: "sectorStock",
@@ -12925,6 +13145,17 @@ function parseRoute() {
     return { page: "strength" };
   }
   if (parts[0] === "earnings-forecast") {
+    if (parts[1]) {
+      const level = ["L1", "L2", "L3"].includes(String(parts[1] || "").toUpperCase())
+        ? String(parts[1]).toUpperCase()
+        : "L3";
+      return {
+        page: "earnings-forecast-detail",
+        level,
+        id: decodeURIComponent(parts[2] || ""),
+        days: Number(query.get("days")) || 30,
+      };
+    }
     return { page: "earnings-forecast" };
   }
   if (parts[0] === "sectors") {
