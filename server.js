@@ -102,6 +102,7 @@ const dailySeriesCache = new Map();
 const strategyIntradayProfileCache = new Map();
 const sectorStrengthCache = new Map();
 const earningsForecastCache = new Map();
+const tradeCalendarRequestCache = new Map();
 const companyAnalysisJobs = new Map();
 const targetTradeDateCache = {
   expiresAt: 0,
@@ -1573,6 +1574,10 @@ function defaultStore() {
     login_devices: [],
     prices: {},
     price_history: {},
+    tushare_cache: {
+      trade_cal: {},
+    },
+    sector_strength_snapshots: {},
     updated_at: now,
   };
 }
@@ -1602,6 +1607,19 @@ function normalizeStore(store) {
     login_devices: Array.isArray(store.login_devices) ? store.login_devices : [],
     prices: store.prices && typeof store.prices === "object" ? store.prices : {},
     price_history: store.price_history && typeof store.price_history === "object" ? store.price_history : {},
+    tushare_cache: normalizeTushareCache(store.tushare_cache),
+    sector_strength_snapshots: store.sector_strength_snapshots && typeof store.sector_strength_snapshots === "object"
+      ? store.sector_strength_snapshots
+      : {},
+  };
+}
+
+function normalizeTushareCache(cache) {
+  const source = cache && typeof cache === "object" ? cache : {};
+  const tradeCal = source.trade_cal && typeof source.trade_cal === "object" ? source.trade_cal : {};
+  return {
+    ...source,
+    trade_cal: tradeCal,
   };
 }
 
@@ -1648,6 +1666,177 @@ function persistStore() {
     await fs.promises.rename(tempFile, dataFile);
   });
   return writeQueue;
+}
+
+function tradeCalendarBucket(exchange = "SSE") {
+  db.tushare_cache = normalizeTushareCache(db.tushare_cache);
+  db.tushare_cache.trade_cal[exchange] = db.tushare_cache.trade_cal[exchange] || {
+    rows: {},
+    updated_at: "",
+  };
+  const bucket = db.tushare_cache.trade_cal[exchange];
+  bucket.rows = bucket.rows && typeof bucket.rows === "object" ? bucket.rows : {};
+  return bucket;
+}
+
+function compactDateList(startDate, endDate) {
+  const start = String(startDate || "");
+  const end = String(endDate || "");
+  const out = [];
+  if (!/^\d{8}$/.test(start) || !/^\d{8}$/.test(end) || start > end) {
+    return out;
+  }
+  let current = start;
+  for (let guard = 0; current <= end && guard < 1200; guard += 1) {
+    out.push(current);
+    current = addCompactDays(current, 1);
+  }
+  return out;
+}
+
+function tradeCalendarRowsFromStore(exchange, startDate, endDate) {
+  const bucket = tradeCalendarBucket(exchange);
+  const dates = compactDateList(startDate, endDate);
+  const rows = dates
+    .map((date) => bucket.rows[date])
+    .filter(Boolean)
+    .map(normalizeTradeCalendarRow)
+    .filter(Boolean)
+    .sort((a, b) => String(a.cal_date).localeCompare(String(b.cal_date)));
+  return {
+    rows,
+    complete: dates.length > 0 && rows.length === dates.length,
+  };
+}
+
+function normalizeTradeCalendarRow(row) {
+  if (!row || typeof row !== "object") {
+    return null;
+  }
+  const calDate = String(row.cal_date || "").trim();
+  if (!/^\d{8}$/.test(calDate)) {
+    return null;
+  }
+  return {
+    exchange: String(row.exchange || "SSE"),
+    cal_date: calDate,
+    is_open: Number(row.is_open || 0),
+    pretrade_date: String(row.pretrade_date || ""),
+  };
+}
+
+function buildFallbackTradeCalendarRows(exchange, startDate, endDate) {
+  let previousOpen = "";
+  return compactDateList(startDate, endDate).map((date) => {
+    const year = Number(date.slice(0, 4));
+    const month = Number(date.slice(4, 6));
+    const day = Number(date.slice(6, 8));
+    const weekday = new Date(year, month - 1, day).getDay();
+    const isOpen = weekday !== 0 && weekday !== 6;
+    const row = {
+      exchange,
+      cal_date: date,
+      is_open: isOpen ? 1 : 0,
+      pretrade_date: previousOpen,
+      fallback: true,
+    };
+    if (isOpen) {
+      previousOpen = date;
+    }
+    return row;
+  });
+}
+
+function mergeCalendarRows(cachedRows, fallbackRows) {
+  const map = new Map();
+  for (const row of fallbackRows || []) {
+    map.set(row.cal_date, row);
+  }
+  for (const row of cachedRows || []) {
+    map.set(row.cal_date, row);
+  }
+  return Array.from(map.values()).sort((a, b) => String(a.cal_date).localeCompare(String(b.cal_date)));
+}
+
+async function getTradeCalendarRows(exchange = "SSE", startDate, endDate) {
+  const normalizedExchange = String(exchange || "SSE").trim() || "SSE";
+  const start = String(startDate || "");
+  const end = String(endDate || "");
+  const cached = tradeCalendarRowsFromStore(normalizedExchange, start, end);
+  if (cached.complete) {
+    return cached.rows;
+  }
+
+  const key = `${normalizedExchange}:${start}:${end}`;
+  if (tradeCalendarRequestCache.has(key)) {
+    return tradeCalendarRequestCache.get(key);
+  }
+
+  const promise = (async () => {
+    try {
+      const rows = await callTushare("trade_cal", {
+        exchange: normalizedExchange,
+        start_date: start,
+        end_date: end,
+      }, "exchange,cal_date,is_open,pretrade_date");
+      const bucket = tradeCalendarBucket(normalizedExchange);
+      for (const row of rows.map(normalizeTradeCalendarRow).filter(Boolean)) {
+        bucket.rows[row.cal_date] = row;
+      }
+      bucket.updated_at = nowIso();
+      await persistStore();
+      return tradeCalendarRowsFromStore(normalizedExchange, start, end).rows;
+    } catch (error) {
+      const fallbackRows = buildFallbackTradeCalendarRows(normalizedExchange, start, end);
+      const merged = mergeCalendarRows(cached.rows, fallbackRows);
+      if (merged.length) {
+        return merged;
+      }
+      throw error;
+    } finally {
+      tradeCalendarRequestCache.delete(key);
+    }
+  })();
+
+  tradeCalendarRequestCache.set(key, promise);
+  return promise;
+}
+
+function getSectorStrengthSnapshot(level, options = {}) {
+  const snapshots = db.sector_strength_snapshots && typeof db.sector_strength_snapshots === "object"
+    ? db.sector_strength_snapshots
+    : {};
+  const snapshot = snapshots[level];
+  if (!snapshot || !Array.isArray(snapshot.rows) || !snapshot.rows.length) {
+    return null;
+  }
+  const maxAgeMs = Number(options.maxAgeMs || 0);
+  if (maxAgeMs > 0) {
+    const cachedAt = new Date(snapshot.cached_at || snapshot.generated_at || 0).getTime();
+    if (!Number.isFinite(cachedAt) || Date.now() - cachedAt > maxAgeMs) {
+      return null;
+    }
+  }
+  const stale = options.stale !== false;
+  return {
+    ...snapshot,
+    stale,
+    warning: stale ? "TuShare 暂时不可用，当前展示最近一次已缓存的资金强弱矩阵。" : "",
+  };
+}
+
+async function persistSectorStrengthSnapshot(level, value) {
+  if (!value || !Array.isArray(value.rows) || !value.rows.length) {
+    return;
+  }
+  db.sector_strength_snapshots = db.sector_strength_snapshots && typeof db.sector_strength_snapshots === "object"
+    ? db.sector_strength_snapshots
+    : {};
+  db.sector_strength_snapshots[level] = {
+    ...value,
+    cached_at: nowIso(),
+  };
+  await persistStore();
 }
 
 async function createGroup(ownerId, name) {
@@ -4075,11 +4264,7 @@ async function getStrategyLimit(tsCode, tradeDate) {
 async function getNextOpenTradeDate(afterDate) {
   const startDate = addCompactDays(afterDate, 1);
   const endDate = addCompactDays(afterDate, 45);
-  const rows = await callTushare("trade_cal", {
-    exchange: "SSE",
-    start_date: startDate,
-    end_date: endDate,
-  }, "exchange,cal_date,is_open,pretrade_date");
+  const rows = await getTradeCalendarRows("SSE", startDate, endDate);
 
   return rows
     .filter((row) => row.is_open === 1 && String(row.cal_date || "") > String(afterDate || ""))
@@ -4650,11 +4835,7 @@ async function getTargetTradeDate() {
   targetTradeDateCache.promise = (async () => {
     const today = formatDateCompactShanghai();
     const range = getDateRange(25);
-    const rows = await callTushare("trade_cal", {
-      exchange: "SSE",
-      start_date: range.start,
-      end_date: today,
-    }, "exchange,cal_date,is_open,pretrade_date");
+    const rows = await getTradeCalendarRows("SSE", range.start, today);
 
     const sorted = rows.slice().sort((a, b) => String(a.cal_date).localeCompare(String(b.cal_date)));
     const todayRow = sorted.find((row) => row.cal_date === today);
@@ -4882,21 +5063,46 @@ async function getSectorStrengthMatrix(options = {}) {
     return cached.value;
   }
 
+  if (!options.refresh) {
+    const stored = getSectorStrengthSnapshot(level, {
+      stale: false,
+      maxAgeMs: 6 * 60 * 60 * 1000,
+    });
+    if (stored) {
+      sectorStrengthCache.set(cacheKey, {
+        value: stored,
+        expiresAt: Date.now() + 6 * 60 * 60 * 1000,
+        promise: null,
+      });
+      return stored;
+    }
+  }
+
   if (cached?.promise) {
     return cached.promise;
   }
 
   const promise = buildSectorStrengthMatrix(level)
-    .then((value) => {
+    .then(async (value) => {
       sectorStrengthCache.set(cacheKey, {
         value,
         expiresAt: Date.now() + (value.error_count ? 5 * 60 * 1000 : 6 * 60 * 60 * 1000),
         promise: null,
       });
+      await persistSectorStrengthSnapshot(level, value).catch(() => {});
       return value;
     })
     .catch((error) => {
       sectorStrengthCache.delete(cacheKey);
+      const snapshot = getSectorStrengthSnapshot(level);
+      if (snapshot) {
+        sectorStrengthCache.set(cacheKey, {
+          value: snapshot,
+          expiresAt: Date.now() + 10 * 60 * 1000,
+          promise: null,
+        });
+        return snapshot;
+      }
       throw error;
     });
 
@@ -6647,11 +6853,7 @@ async function getRecentOpenTradeDates(count) {
   const daysBack = Math.max(80, count * 2 + 30);
   const range = getDateRange(daysBack);
   const today = formatDateCompactShanghai();
-  const rows = await callTushare("trade_cal", {
-    exchange: "SSE",
-    start_date: range.start,
-    end_date: today,
-  }, "exchange,cal_date,is_open,pretrade_date");
+  const rows = await getTradeCalendarRows("SSE", range.start, today);
 
   return rows
     .filter((row) => row.is_open === 1 && row.cal_date <= today)

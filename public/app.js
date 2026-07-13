@@ -6156,6 +6156,7 @@ function renderStrengthScoringGuide(viewLabel, summary = {}, matrix = {}) {
       <span>综合评分 = 资金强度 × 35% + 持续性 × 35% + 扩散度 × 20% + 价格确认 × 10%。所有单项分都归一到 0-100 分，同级板块之间横向比较，分数越高表示相对越强。</span>
       <span>底层资金数据来自板块成分股资金流聚合：每日把成分股 net_mf_amount 加总为板块净流入，同时统计绝对资金流、净流入股票数、覆盖股票数等字段。</span>
       ${summary.top ? `<span>当前最高：${escapeHtml(summary.top.name)}，综合 ${formatScore(summary.top.overall_score)} 分，状态 ${escapeHtml(summary.top.status)}。</span>` : ""}
+      ${matrix.stale ? `<span>${escapeHtml(matrix.warning || "当前展示最近一次缓存的资金强弱矩阵。")}</span>` : ""}
       ${matrix.error_count ? `<span>本次有 ${formatNumber(matrix.error_count, 0)} 个交易日读取失败，矩阵可能不完整；可以稍后刷新重跑。</span>` : ""}
     </div>
     <div class="methodology-grid scoring-grid">
